@@ -433,10 +433,12 @@ def seed_demo_data(force: bool = False) -> int:
     with db() as conn:
         existing = conn.execute("SELECT COUNT(*) AS c FROM documents WHERE source_type='demo'").fetchone()["c"]
         other = conn.execute("SELECT COUNT(*) AS c FROM documents WHERE source_type!='demo'").fetchone()["c"]
-    # Once real content exists (an upload, or a connected Confluence sync), stop
-    # auto-seeding the fictional Nimbus demo docs on every startup. `force=True`
+    # Once real content exists OR is configured (an upload, a connected
+    # Confluence/web source — including one only known via env-var fallback,
+    # about to be pulled in by the startup auto-resync on ephemeral-disk
+    # hosting), stop auto-seeding the fictional Nimbus demo docs. `force=True`
     # (the sidebar's "Reset demo data" button) still works either way.
-    if not force and (existing or other):
+    if not force and (existing or other or get_confluence_config() or get_web_config()):
         return 0
     if force:
         with db() as conn:
