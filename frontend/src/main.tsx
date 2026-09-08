@@ -1,8 +1,8 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
-  AudioLines, BookOpen, ChevronDown, CircleStop, FileText, Globe, Headphones,
-  Link2, Loader2, MessageSquareText, Mic, MonitorUp, Plus, RefreshCw, Send,
+  AudioLines, BookOpen, ChevronDown, CircleStop, Clock, FileText, Globe, Headphones,
+  Link2, Loader2, MessageSquareText, Mic, MonitorUp, Plus, RefreshCw, Search, Send,
   Settings2, Sparkles, Trash2, Zap
 } from "lucide-react";
 import "./styles.css";
@@ -19,6 +19,10 @@ type WebStatusT = {
   last_synced_at?:string; last_synced_pages:number
 };
 type Source = { document_id:string; filename:string; chunk_index:number; score:number; excerpt:string; url?:string };
+type QaLogEntry = {
+  id:string; question:string; answer:string; confidence?:number; provider?:string;
+  source_filename?:string; source_url?:string; follow_up?:string; created_at:string
+};
 type Answer = { answer:string; confidence:number; sources:Source[]; follow_up?:string; mode:string; provider:string; question:string };
 type Providers = { openai:boolean; claude:boolean; demo:boolean; openai_model:string; claude_model:string; transcription_model:string };
 
@@ -45,7 +49,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
-  const [tab, setTab] = useState<"answer"|"live">("answer");
+  const [tab, setTab] = useState<"answer"|"live"|"history">("answer");
   const [transcript, setTranscript] = useState<TranscriptLine[]>([
     {speaker:"Customer", text:"We currently use a phone-based assistant for booking changes.", ts:"00:03"},
     {speaker:"Customer", text:"Can your platform test IVR navigation and DTMF inputs?", ts:"00:10"}
@@ -73,6 +77,10 @@ function App() {
   const [webSyncing, setWebSyncing] = useState(false);
   const [webError, setWebError] = useState("");
 
+  const [qaLog, setQaLog] = useState<QaLogEntry[]>([]);
+  const [qaLogLoading, setQaLogLoading] = useState(false);
+  const [qaLogSearch, setQaLogSearch] = useState("");
+
   const context = useMemo(() => `Customer: ${customer}\nCall type: ${callType}\n${callContext}`, [customer, callType, callContext]);
 
   async function refresh() {
@@ -83,6 +91,27 @@ function App() {
     } catch { setError("Backend is not reachable. Start FastAPI on port 8000."); }
   }
   useEffect(() => { refresh(); refreshConfluence(); refreshWeb(); }, []);
+  useEffect(() => { if (tab === "history" && qaLog.length === 0 && !qaLogLoading) refreshQaLog(); }, [tab]);
+
+  async function refreshQaLog() {
+    setQaLogLoading(true);
+    try {
+      const r = await fetch(`${API}/qa-log?limit=200`);
+      if (r.ok) setQaLog(await r.json());
+    } catch { /* backend not reachable yet; refresh() already surfaces that error */ }
+    finally { setQaLogLoading(false); }
+  }
+
+  async function deleteQaLogEntry(id:string) {
+    await fetch(`${API}/qa-log/${id}`, {method:"DELETE"});
+    setQaLog(prev => prev.filter(e => e.id !== id));
+  }
+
+  async function clearQaLog() {
+    if (!window.confirm("Clear all Q&A history? This can't be undone.")) return;
+    await fetch(`${API}/qa-log`, {method:"DELETE"});
+    setQaLog([]);
+  }
 
   // Syncs run in a background thread server-side and can take minutes (a big
   // Confluence space, a few hundred docs pages) — too long for a hosting
@@ -364,7 +393,7 @@ function App() {
         </div>
 
         <div className="toolbar card">
-          <div className="tabs"><button className={tab==="answer"?"active":""} onClick={()=>setTab("answer")}><MessageSquareText size={16}/> Copilot</button><button className={tab==="live"?"active":""} onClick={()=>setTab("live")}><AudioLines size={16}/> Live Demo</button></div>
+          <div className="tabs"><button className={tab==="answer"?"active":""} onClick={()=>setTab("answer")}><MessageSquareText size={16}/> Copilot</button><button className={tab==="live"?"active":""} onClick={()=>setTab("live")}><AudioLines size={16}/> Live Demo</button><button className={tab==="history"?"active":""} onClick={()=>setTab("history")}><Clock size={16}/> History</button></div>
           <div className="controls">
             <label><Settings2 size={14}/><select value={provider} onChange={e=>setProvider(e.target.value)}><option value="auto">Auto provider</option><option value="openai">OpenAI {providers?.openai?"✓":"(no key)"}</option><option value="claude">Claude {providers?.claude?"✓":"(no key)"}</option><option value="demo">Demo / no key</option></select></label>
             <label><select value={style} onChange={e=>setStyle(e.target.value)}><option value="short">Short answer</option><option value="detailed">Detailed</option><option value="technical">Technical</option></select></label>
@@ -389,7 +418,7 @@ function App() {
               <div className="sources">{result.sources.map((s,i)=><details key={`${s.document_id}-${s.chunk_index}`}><summary><div><span className="num">{i+1}</span>{s.url ? <a href={s.url} target="_blank" rel="noreferrer" onClick={e=>e.stopPropagation()}><b>{s.filename}</b></a> : <b>{s.filename}</b>}</div><small>{Math.round(s.score*100)}% match <ChevronDown size={14}/></small></summary><p>{s.excerpt}</p></details>)}</div>
             </>}
           </div>
-        </> : <div className="liveGrid">
+        </> : tab === "live" ? <div className="liveGrid">
           <div className="card livePanel">
             <div className="liveHead"><div><span className="eyebrow">LIVE TRANSCRIPT</span><h2>{live?"Listening to call":"Call simulator"}</h2></div><div className={`liveDot ${live?"on":""}`}><i/>{liveStatus}</div></div>
             <div className="transcript">{transcript.map((t,i)=><div className="line" key={i}><span>{t.ts}</span><b>{t.speaker}</b><p>{t.text}</p></div>)}</div>
@@ -401,6 +430,32 @@ function App() {
             {!live?<button className="primary large" onClick={startLive}><AudioLines size={18}/> Start live demo</button>:<button className="danger large" onClick={stopLive}><CircleStop size={18}/> Stop listening</button>}
             <div className="capNote"><b>Requires OpenAI key for speech-to-text.</b><span>Typed transcript simulation works without any API key.</span></div>
           </div>
+        </div> : <div className="history card">
+          <div className="historyHead">
+            <div className="historySearch"><Search size={14}/><input placeholder="Search past questions and answers…" value={qaLogSearch} onChange={e=>setQaLogSearch(e.target.value)}/></div>
+            <div className="historyActions">
+              <button className="ghostBtn" onClick={refreshQaLog} disabled={qaLogLoading}>{qaLogLoading?<Loader2 className="spin" size={14}/>:<RefreshCw size={14}/>} Refresh</button>
+              {qaLog.length > 0 && <button className="ghostBtn cfDanger" onClick={clearQaLog}><Trash2 size={14}/> Clear all</button>}
+            </div>
+          </div>
+          {(() => {
+            const term = qaLogSearch.trim().toLowerCase();
+            const filtered = term ? qaLog.filter(e => e.question.toLowerCase().includes(term) || e.answer.toLowerCase().includes(term)) : qaLog;
+            if (qaLogLoading && qaLog.length === 0) return <div className="historyEmpty"><Loader2 className="spin" size={22}/><p>Loading history…</p></div>;
+            if (filtered.length === 0) return <div className="historyEmpty"><Clock size={26}/><h2>{qaLog.length===0 ? "No questions asked yet" : "No matches"}</h2><p>{qaLog.length===0 ? "Every question asked in the Copilot tab, the overlay, or a live call gets logged here for later reference." : "Try a different search term."}</p></div>;
+            return <div className="historyList">{filtered.map(e => <div className="historyEntry" key={e.id}>
+              <div className="historyEntryHead">
+                <span className="historyTime">{new Date(e.created_at).toLocaleString()}</span>
+                <button className="historyDelete" onClick={()=>deleteQaLogEntry(e.id)} title="Delete"><Trash2 size={13}/></button>
+              </div>
+              <b className="historyQ">{e.question}</b>
+              <p className="historyA">{e.answer}</p>
+              <div className="historyMeta">
+                {typeof e.confidence === "number" && <span>{Math.round(e.confidence*100)}% confidence</span>}
+                {e.source_filename && (e.source_url ? <a href={e.source_url} target="_blank" rel="noreferrer">{e.source_filename}</a> : <span>{e.source_filename}</span>)}
+              </div>
+            </div>)}</div>;
+          })()}
         </div>}
       </section>
     </section>

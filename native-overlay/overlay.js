@@ -230,9 +230,28 @@ askForm.addEventListener('submit', (e) => {
   });
 });
 
+async function loadRecentHistory() {
+  try {
+    const response = await apiFetch('/qa-log?limit=15');
+    if (!response.ok) return;
+    const rows = await response.json();
+    // Server returns newest-first; render oldest-first like a chat log.
+    for (const row of rows.slice().reverse()) {
+      askHistory.push({
+        question: row.question, answer: row.answer, confidence: row.confidence,
+        follow_up: row.follow_up, source: row.source_filename,
+      });
+    }
+    renderAskLog();
+  } catch (_) {
+    // No history yet, or backend briefly unreachable — the ask box still works either way.
+  }
+}
+
 renderMode(false);
 window.callpilot.apiConfig().then((cfg) => {
   if (cfg && cfg.apiBase) API = cfg.apiBase;
   if (cfg && cfg.apiKey) API_KEY = cfg.apiKey;
+  loadRecentHistory();
   poll();
 });
