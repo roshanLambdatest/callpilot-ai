@@ -583,8 +583,20 @@ def resolve_provider(requested: str) -> str:
     return "demo"
 
 
-def retrieve(question: str, top_k: int = 5) -> List[dict]:
+# retrieve() used to re-fit a TF-IDF vectorizer over the *entire* corpus on
+# every single question — with 1000+ chunks that's real, avoidable latency on
+# every /ask call. The corpus only actually changes on upload/delete/sync, so
+# cache the fitted vectorizer + matrix and just transform() the question
+# against it; only rebuild when a cheap (count, max rowid) signature changes.
+_RETRIEVAL_CACHE = {"signature": None, "vectorizer": None, "matrix": None, "rows": None}
+_RETRIEVAL_LOCK = threading.Lock()
+
+
+def _retrieval_index() -> dict:
     with db() as conn:
+        signature = tuple(conn.execute("SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM chunks").fetchone())
+        if _RETRIEVAL_CACHE["signature"] == signature:
+            return _RETRIEVAL_CACHE
         rows = conn.execute(
             """
             SELECT c.document_id, c.chunk_index, c.content, d.filename, d.path, d.source_type
@@ -592,12 +604,22 @@ def retrieve(question: str, top_k: int = 5) -> List[dict]:
             ORDER BY d.created_at DESC, c.chunk_index ASC
             """
         ).fetchall()
-    if not rows:
+    vectorizer = matrix = None
+    if rows:
+        vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=40000, sublinear_tf=True)
+        matrix = vectorizer.fit_transform([r["content"] for r in rows])
+    _RETRIEVAL_CACHE.update({"signature": signature, "vectorizer": vectorizer, "matrix": matrix, "rows": rows})
+    return _RETRIEVAL_CACHE
+
+
+def retrieve(question: str, top_k: int = 5) -> List[dict]:
+    with _RETRIEVAL_LOCK:
+        cache = _retrieval_index()
+    rows, vectorizer, matrix = cache["rows"], cache["vectorizer"], cache["matrix"]
+    if not rows or vectorizer is None:
         return []
-    corpus = [r["content"] for r in rows]
-    vectorizer = TfidfVectorizer(stop_words="english", ngram_range=(1, 2), max_features=40000, sublinear_tf=True)
-    matrix = vectorizer.fit_transform(corpus + [question])
-    scores = cosine_similarity(matrix[-1], matrix[:-1]).flatten()
+    q_vec = vectorizer.transform([question])
+    scores = cosine_similarity(q_vec, matrix).flatten()
     ranked = np.argsort(scores)[::-1][: max(1, min(top_k, len(rows)))]
     return [
         {
