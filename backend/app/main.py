@@ -1240,6 +1240,33 @@ def ask_stream(req: AskRequest):
 
         system, user = build_prompt(question, results, req.call_context, req.answer_style)
         full_text = ""
+        # Deltas are raw model output, but the prompt makes the model end every
+        # answer with a "FOLLOW_UP: ..." line meant to be shown separately, not
+        # appended to the visible answer text — so hold back anything from that
+        # marker onward instead of streaming it (and hold back a short tail
+        # even before it's found, in case the marker itself lands split across
+        # two chunks).
+        MARKER = "FOLLOW_UP:"
+        emitted_len = 0
+        marker_found = False
+
+        def next_delta():
+            nonlocal emitted_len, marker_found
+            if marker_found:
+                return None
+            idx = full_text.find(MARKER)
+            if idx != -1:
+                marker_found = True
+                piece = full_text[emitted_len:idx]
+                emitted_len = idx
+                return piece or None
+            safe_len = max(emitted_len, len(full_text) - (len(MARKER) - 1))
+            if safe_len > emitted_len:
+                piece = full_text[emitted_len:safe_len]
+                emitted_len = safe_len
+                return piece
+            return None
+
         try:
             if provider == "openai":
                 client = get_openai_client()
@@ -1251,7 +1278,9 @@ def ask_stream(req: AskRequest):
                     piece = chunk.choices[0].delta.content if chunk.choices else None
                     if piece:
                         full_text += piece
-                        yield _sse("delta", {"text": piece})
+                        out = next_delta()
+                        if out:
+                            yield _sse("delta", {"text": out})
             else:
                 client = get_anthropic_client()
                 token_cap = {"short": 220, "detailed": 500, "technical": 700}.get(req.answer_style, 500)
@@ -1262,7 +1291,9 @@ def ask_stream(req: AskRequest):
                 ) as stream:
                     for piece in stream.text_stream:
                         full_text += piece
-                        yield _sse("delta", {"text": piece})
+                        out = next_delta()
+                        if out:
+                            yield _sse("delta", {"text": out})
         except Exception:
             yield from fallback()
             return
