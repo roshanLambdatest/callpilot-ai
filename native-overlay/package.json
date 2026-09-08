@@ -1,0 +1,10 @@
+{
+  "name": "callpilot-native-companion",
+  "version": "4.3.0",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test meetingLifecycle.test.cjs"
+  },
+  "devDependencies": { "electron": "^44.0.0" }
+}

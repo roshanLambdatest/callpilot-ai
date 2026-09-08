@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --version)",
+      "Bash(python3 -V)",
+      "Bash(echo \"exit:$?\")",
+      "Bash(/usr/local/bin/python3 *)",
+      "Read(//usr/local/Cellar/python@3.13/3.13.6/Frameworks/Python.framework/Versions/3.13/bin/**)",
+      "Bash(echo \"EXIT=$?\")"
+    ]
+  }
+}

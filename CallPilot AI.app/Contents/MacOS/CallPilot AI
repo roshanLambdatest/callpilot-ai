@@ -1,0 +1,13 @@
+#!/bin/bash
+APP_DIR="$HOME/Library/Application Support/CallPilot AI"
+if [ ! -f "$APP_DIR/.callpilot-installed" ]; then
+  if [ -x "$APP_DIR/INSTALL-CALLPILOT-MAC.command" ]; then
+    exec /usr/bin/open -a Terminal "$APP_DIR/INSTALL-CALLPILOT-MAC.command"
+  fi
+  # When launched directly from the downloaded package on first run.
+  PACKAGE_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
+  exec /usr/bin/open -a Terminal "$PACKAGE_DIR/INSTALL-CALLPILOT-MAC.command"
+else
+  "$APP_DIR/AUTOSTART-CALLPILOT.command" >/dev/null 2>&1 &
+  exit 0
+fi

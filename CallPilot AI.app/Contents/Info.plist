@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>CallPilot AI</string>
+	<key>CFBundleExecutable</key>
+	<string>CallPilot AI</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.callpilot.launcher</string>
+	<key>CFBundleName</key>
+	<string>CallPilot AI</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>4.3.0</string>
+	<key>CFBundleVersion</key>
+	<string>4.3.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>10.15</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>CallPilot captures call audio so it can transcribe questions locally and provide private knowledge-grounded answers.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>CallPilot uses your microphone to include your side of the call in local transcription.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>CallPilot requests system-audio capture permission for call transcription; it does not use the captured video.</string>
+</dict>
+</plist>

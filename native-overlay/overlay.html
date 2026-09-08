@@ -1,0 +1,52 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="overlay.css" />
+</head>
+<body>
+  <button id="bubble" class="bubble" aria-label="Open CallPilot">
+    <span class="spark">✦</span>
+    <span id="unread" class="unread" hidden></span>
+  </button>
+
+  <main id="panel" class="panel" hidden>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brandIcon">✦</span>
+        <span>CallPilot</span>
+        <span id="statusDot" class="statusDot"></span>
+      </div>
+      <button id="collapse" class="iconButton" aria-label="Minimize">—</button>
+    </header>
+
+    <section id="empty" class="emptyState">
+      <div class="emptyIcon">✦</div>
+      <div class="emptyTitle">CallPilot is listening</div>
+      <div class="emptyHint">Answers will appear here when a customer asks a question.</div>
+    </section>
+
+    <section id="content" hidden>
+      <div class="qaBlock">
+        <div class="label">QUESTION</div>
+        <div id="question" class="question"></div>
+      </div>
+
+      <div class="qaBlock answerBlock">
+        <div class="label">ANSWER</div>
+        <div id="answer" class="answer"></div>
+      </div>
+
+      <div id="follow" class="follow" hidden></div>
+
+      <footer>
+        <span id="source"></span>
+        <span id="confidence"></span>
+      </footer>
+    </section>
+  </main>
+
+  <script src="overlay.js"></script>
+</body>
+</html>
