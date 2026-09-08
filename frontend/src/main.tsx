@@ -84,10 +84,42 @@ function App() {
   }
   useEffect(() => { refresh(); refreshConfluence(); refreshWeb(); }, []);
 
+  // Syncs run in a background thread server-side and can take minutes (a big
+  // Confluence space, a few hundred docs pages) — too long for a hosting
+  // platform's request proxy to sit on. The sync endpoints just kick the job
+  // off; this polls /status until `syncing` flips back to false.
+  async function pollUntilSynced(kind: "confluence"|"web") {
+    const statusUrl = kind === "confluence" ? `${API}/integrations/confluence/status` : `${API}/integrations/web/status`;
+    const setStatus: (s:any)=>void = kind === "confluence" ? setConfluence : (setWeb as any);
+    const setSyncing = kind === "confluence" ? setCfSyncing : setWebSyncing;
+    const setErr = kind === "confluence" ? setCfError : setWebError;
+    setSyncing(true);
+    for (let i = 0; i < 300; i++) {
+      try {
+        const r = await fetch(statusUrl);
+        if (r.ok) {
+          const data = await r.json();
+          setStatus(data);
+          if (!data.syncing) {
+            if (data.last_error) setErr(data.last_error);
+            break;
+          }
+        }
+      } catch { /* transient network hiccup; keep polling */ }
+      await new Promise(res => setTimeout(res, 2000));
+    }
+    setSyncing(false);
+    await refresh();
+  }
+
   async function refreshConfluence() {
     try {
       const r = await fetch(`${API}/integrations/confluence/status`);
-      if (r.ok) setConfluence(await r.json());
+      if (r.ok) {
+        const data = await r.json();
+        setConfluence(data);
+        if (data.syncing) pollUntilSynced("confluence");
+      }
     } catch { /* backend not reachable yet; refresh() already surfaces that error */ }
   }
 
@@ -108,14 +140,13 @@ function App() {
   }
 
   async function syncConfluence() {
-    setCfSyncing(true); setCfError("");
+    setCfError("");
     try {
       const r = await fetch(`${API}/integrations/confluence/sync`, {method:"POST"});
       const data = await r.json();
-      if (!r.ok) throw new Error(data.detail || "Sync failed");
-      await Promise.all([refreshConfluence(), refresh()]);
+      if (!r.ok) throw new Error(data.detail || "Sync failed to start");
+      await pollUntilSynced("confluence");
     } catch(e:any) { setCfError(e.message); }
-    finally { setCfSyncing(false); }
   }
 
   async function disconnectConfluence() {
@@ -128,7 +159,11 @@ function App() {
   async function refreshWeb() {
     try {
       const r = await fetch(`${API}/integrations/web/status`);
-      if (r.ok) setWeb(await r.json());
+      if (r.ok) {
+        const data = await r.json();
+        setWeb(data);
+        if (data.syncing) pollUntilSynced("web");
+      }
     } catch { /* backend not reachable yet; refresh() already surfaces that error */ }
   }
 
@@ -148,14 +183,13 @@ function App() {
   }
 
   async function syncWeb() {
-    setWebSyncing(true); setWebError("");
+    setWebError("");
     try {
       const r = await fetch(`${API}/integrations/web/sync`, {method:"POST"});
       const data = await r.json();
-      if (!r.ok) throw new Error(data.detail || "Sync failed");
-      await Promise.all([refreshWeb(), refresh()]);
+      if (!r.ok) throw new Error(data.detail || "Sync failed to start");
+      await pollUntilSynced("web");
     } catch(e:any) { setWebError(e.message); }
-    finally { setWebSyncing(false); }
   }
 
   async function disconnectWeb() {

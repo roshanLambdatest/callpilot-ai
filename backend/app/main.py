@@ -94,6 +94,17 @@ async def require_access_token(request, call_next):
     return await call_next(request)
 
 
+# Confluence/web syncs can take minutes on a large space or docs site, which
+# blows past hosting-platform proxy timeouts (e.g. Render's) if run inline on
+# the request. Both run in a background thread instead; the sync endpoints
+# return immediately and the status endpoints report SYNC_STATE for polling.
+SYNC_STATE = {
+    "confluence": {"running": False, "error": None},
+    "web": {"running": False, "error": None},
+}
+SYNC_LOCK = threading.Lock()
+
+
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -333,7 +344,16 @@ MAX_WEB_PAGES = 600
 def get_web_config() -> Optional[dict]:
     with db() as conn:
         row = conn.execute("SELECT * FROM web_config WHERE id=1").fetchone()
-    return dict(row) if row else None
+    if row:
+        return dict(row)
+    sitemap_url = os.getenv("WEB_SITEMAP_URL")
+    path_prefix = os.getenv("WEB_PATH_PREFIX")
+    if sitemap_url and path_prefix:
+        return {
+            "label": os.getenv("WEB_LABEL", "Docs"), "sitemap_url": sitemap_url, "path_prefix": path_prefix,
+            "last_synced_at": None, "last_synced_pages": 0,
+        }
+    return None
 
 
 def fetch_sitemap_urls(sitemap_url: str, path_prefix: str, timeout: int = 20) -> List[str]:
@@ -493,6 +513,8 @@ class ConfluenceStatus(BaseModel):
     space_name: Optional[str] = None
     last_synced_at: Optional[str] = None
     last_synced_pages: int = 0
+    syncing: bool = False
+    last_error: Optional[str] = None
 
 
 class WebConnectRequest(BaseModel):
@@ -508,6 +530,8 @@ class WebStatus(BaseModel):
     path_prefix: Optional[str] = None
     last_synced_at: Optional[str] = None
     last_synced_pages: int = 0
+    syncing: bool = False
+    last_error: Optional[str] = None
 
 
 class OverlayPushRequest(BaseModel):
@@ -791,8 +815,9 @@ def delete_document(document_id: str):
 
 def _confluence_status_response() -> ConfluenceStatus:
     cfg = get_confluence_config()
+    state = SYNC_STATE["confluence"]
     if not cfg:
-        return ConfluenceStatus(connected=False)
+        return ConfluenceStatus(connected=False, syncing=state["running"], last_error=state["error"])
     last_synced = cfg.get("last_synced_at")
     return ConfluenceStatus(
         connected=True,
@@ -802,6 +827,8 @@ def _confluence_status_response() -> ConfluenceStatus:
         space_name=cfg.get("space_name"),
         last_synced_at=str(last_synced) if last_synced else None,
         last_synced_pages=cfg.get("last_synced_pages") or 0,
+        syncing=state["running"],
+        last_error=state["error"],
     )
 
 
@@ -839,37 +866,57 @@ def confluence_connect(req: ConfluenceConnectRequest):
     return _confluence_status_response()
 
 
-@app.post("/integrations/confluence/sync")
-def confluence_sync():
-    cfg = get_confluence_config()
-    if not cfg:
-        raise HTTPException(status_code=400, detail="Connect Confluence first")
+def _run_confluence_sync() -> None:
+    state = SYNC_STATE["confluence"]
     try:
+        cfg = get_confluence_config()
+        if not cfg:
+            return
         space = confluence_find_space(cfg["base_url"], cfg["email"], cfg["api_token"], cfg["space_key"])
         pages = confluence_fetch_pages(cfg["base_url"], cfg["email"], cfg["api_token"], space["id"])
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Confluence sync failed: {exc}")
 
-    clear_confluence_documents()
-    indexed = 0
-    for page in pages:
-        if index_confluence_page(page, cfg["base_url"], cfg["space_key"]):
-            indexed += 1
+        clear_confluence_documents()
+        indexed = 0
+        for page in pages:
+            if index_confluence_page(page, cfg["base_url"], cfg["space_key"]):
+                indexed += 1
 
-    space_name = space.get("name") or cfg["space_key"]
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO confluence_config (id, base_url, email, api_token, space_key, space_name, last_synced_at, last_synced_pages)
-            VALUES (1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-            ON CONFLICT(id) DO UPDATE SET space_name=excluded.space_name, last_synced_at=CURRENT_TIMESTAMP, last_synced_pages=excluded.last_synced_pages
-            """,
-            (cfg["base_url"], cfg["email"], cfg["api_token"], cfg["space_key"], space_name, indexed),
-        )
-        conn.commit()
-    return {"synced": True, "pages_found": len(pages), "pages_indexed": indexed}
+        space_name = space.get("name") or cfg["space_key"]
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO confluence_config (id, base_url, email, api_token, space_key, space_name, last_synced_at, last_synced_pages)
+                VALUES (1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                ON CONFLICT(id) DO UPDATE SET space_name=excluded.space_name, last_synced_at=CURRENT_TIMESTAMP, last_synced_pages=excluded.last_synced_pages
+                """,
+                (cfg["base_url"], cfg["email"], cfg["api_token"], cfg["space_key"], space_name, indexed),
+            )
+            conn.commit()
+        state["error"] = None
+    except Exception as exc:
+        state["error"] = str(exc)
+    finally:
+        state["running"] = False
+
+
+def start_confluence_sync() -> bool:
+    """Returns False if a sync is already running or nothing is configured."""
+    if not get_confluence_config():
+        return False
+    with SYNC_LOCK:
+        if SYNC_STATE["confluence"]["running"]:
+            return False
+        SYNC_STATE["confluence"]["running"] = True
+    threading.Thread(target=_run_confluence_sync, daemon=True).start()
+    return True
+
+
+@app.post("/integrations/confluence/sync")
+def confluence_sync():
+    if not get_confluence_config():
+        raise HTTPException(status_code=400, detail="Connect Confluence first")
+    started = start_confluence_sync()
+    return {"started": started, "already_running": not started and SYNC_STATE["confluence"]["running"]}
 
 
 @app.delete("/integrations/confluence/disconnect")
@@ -883,8 +930,9 @@ def confluence_disconnect():
 
 def _web_status_response() -> WebStatus:
     cfg = get_web_config()
+    state = SYNC_STATE["web"]
     if not cfg:
-        return WebStatus(connected=False)
+        return WebStatus(connected=False, syncing=state["running"], last_error=state["error"])
     last_synced = cfg.get("last_synced_at")
     return WebStatus(
         connected=True,
@@ -893,6 +941,8 @@ def _web_status_response() -> WebStatus:
         path_prefix=cfg["path_prefix"],
         last_synced_at=str(last_synced) if last_synced else None,
         last_synced_pages=cfg.get("last_synced_pages") or 0,
+        syncing=state["running"],
+        last_error=state["error"],
     )
 
 
@@ -929,35 +979,55 @@ def web_connect(req: WebConnectRequest):
     return _web_status_response()
 
 
+def _run_web_sync() -> None:
+    state = SYNC_STATE["web"]
+    try:
+        cfg = get_web_config()
+        if not cfg:
+            return
+        urls = fetch_sitemap_urls(cfg["sitemap_url"], cfg["path_prefix"])[:MAX_WEB_PAGES]
+
+        clear_web_documents()
+        indexed = 0
+        for url in urls:
+            if index_web_page(url, cfg["label"]):
+                indexed += 1
+            time.sleep(0.12)  # be polite to the source site
+
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO web_config (id, label, sitemap_url, path_prefix, last_synced_at, last_synced_pages)
+                VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                ON CONFLICT(id) DO UPDATE SET last_synced_at=CURRENT_TIMESTAMP, last_synced_pages=excluded.last_synced_pages
+                """,
+                (cfg["label"], cfg["sitemap_url"], cfg["path_prefix"], indexed),
+            )
+            conn.commit()
+        state["error"] = None
+    except Exception as exc:
+        state["error"] = str(exc)
+    finally:
+        state["running"] = False
+
+
+def start_web_sync() -> bool:
+    if not get_web_config():
+        return False
+    with SYNC_LOCK:
+        if SYNC_STATE["web"]["running"]:
+            return False
+        SYNC_STATE["web"]["running"] = True
+    threading.Thread(target=_run_web_sync, daemon=True).start()
+    return True
+
+
 @app.post("/integrations/web/sync")
 def web_sync():
-    cfg = get_web_config()
-    if not cfg:
+    if not get_web_config():
         raise HTTPException(status_code=400, detail="Connect a website source first")
-    try:
-        urls = fetch_sitemap_urls(cfg["sitemap_url"], cfg["path_prefix"])
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Could not reach that sitemap: {exc}")
-    urls = urls[:MAX_WEB_PAGES]
-
-    clear_web_documents()
-    indexed = 0
-    for url in urls:
-        if index_web_page(url, cfg["label"]):
-            indexed += 1
-        time.sleep(0.12)  # be polite to the source site
-
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO web_config (id, label, sitemap_url, path_prefix, last_synced_at, last_synced_pages)
-            VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP, ?)
-            ON CONFLICT(id) DO UPDATE SET last_synced_at=CURRENT_TIMESTAMP, last_synced_pages=excluded.last_synced_pages
-            """,
-            (cfg["label"], cfg["sitemap_url"], cfg["path_prefix"], indexed),
-        )
-        conn.commit()
-    return {"synced": True, "pages_found": len(urls), "pages_indexed": indexed}
+    started = start_web_sync()
+    return {"started": started, "already_running": not started and SYNC_STATE["web"]["running"]}
 
 
 @app.delete("/integrations/web/disconnect")
@@ -967,6 +1037,21 @@ def web_disconnect():
         conn.execute("DELETE FROM web_config WHERE id=1")
         conn.commit()
     return {"disconnected": True}
+
+
+@app.on_event("startup")
+def _auto_sync_on_startup() -> None:
+    # Free-tier hosting wipes local disk on every cold start; if the source
+    # config is available (DB row, or env-var fallback) but this fresh
+    # instance has no indexed documents for it yet, re-sync automatically
+    # instead of silently serving an empty/demo knowledge base.
+    with db() as conn:
+        has_confluence_docs = conn.execute("SELECT 1 FROM documents WHERE source_type='confluence' LIMIT 1").fetchone()
+        has_web_docs = conn.execute("SELECT 1 FROM documents WHERE source_type='web' LIMIT 1").fetchone()
+    if not has_confluence_docs:
+        start_confluence_sync()
+    if not has_web_docs:
+        start_web_sync()
 
 
 @app.post("/ask", response_model=AskResponse)
