@@ -82,17 +82,67 @@ async function transcribe(blob) {
   return r.json();
 }
 
+// Streams the same way the overlay's manual ask box does, but pushes each
+// growing partial answer to /overlay/push so the auto-detected question card
+// visibly streams too, instead of sitting blank for the full 2-5s until the
+// whole answer is ready.
 async function answerQuestion(question) {
   if (!question || question === lastQuestion) return;
   lastQuestion = question;
-  const answer = await postJson('/ask', { question, provider: 'auto', answer_style: 'short', top_k: 5, call_context: rollingTranscript.slice(-3500) });
-  await postJson('/overlay/push', {
-    question,
-    answer: answer.answer,
-    confidence: answer.confidence || 0,
-    source: answer.sources?.[0]?.filename || null,
-    follow_up: answer.follow_up || null
+
+  const response = await fetch(`${API}/ask/stream`, {
+    method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ question, provider: 'auto', answer_style: 'short', top_k: 5, call_context: rollingTranscript.slice(-3500) }),
+    signal: abortController?.signal
   });
+  if (!response.ok || !response.body) throw new Error(`/ask/stream: ${await response.text().catch(() => '')}`);
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let answerText = '';
+  let confidence = 0;
+  let source = null;
+  let followUp = null;
+  let lastPush = 0;
+
+  const pushState = async (force) => {
+    const now = Date.now();
+    if (!force && now - lastPush < 200) return; // throttle mid-stream pushes
+    lastPush = now;
+    await postJson('/overlay/push', { question, answer: answerText, confidence, source, follow_up: followUp });
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let sepIndex;
+    while ((sepIndex = buffer.indexOf('\n\n')) !== -1) {
+      const rawEvent = buffer.slice(0, sepIndex);
+      buffer = buffer.slice(sepIndex + 2);
+      const eventLine = rawEvent.split('\n').find((l) => l.startsWith('event: '));
+      const dataLine = rawEvent.split('\n').find((l) => l.startsWith('data: '));
+      if (!eventLine || !dataLine) continue;
+      const eventType = eventLine.slice('event: '.length).trim();
+      let payload;
+      try { payload = JSON.parse(dataLine.slice('data: '.length)); } catch (_) { continue; }
+
+      if (eventType === 'sources') {
+        confidence = payload.confidence || 0;
+        source = (payload.sources && payload.sources[0]) ? payload.sources[0].filename : null;
+        await pushState(true);
+      } else if (eventType === 'delta') {
+        answerText += payload.text;
+        await pushState(false);
+      } else if (eventType === 'done') {
+        answerText = payload.answer;
+        confidence = payload.confidence;
+        followUp = payload.follow_up;
+        await pushState(true);
+      }
+    }
+  }
 }
 
 async function loop(segmentMs) {
@@ -127,7 +177,10 @@ async function start(opts={}) {
     lastQuestion = '';
     await mixAudio(opts.includeMic !== false);
     active = true;
-    loop(Math.max(4000, Number(opts.segmentMs || 8000)));
+    // Nothing gets processed until a segment finishes recording, so this
+    // window is pure dead time before transcription/detection/answering even
+    // start — 8s was adding up to 8s of latency before anything happened.
+    loop(Math.max(3000, Number(opts.segmentMs || 4000)));
     return { ok: true };
   } catch (e) {
     await stop('start-failed');

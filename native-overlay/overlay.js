@@ -176,7 +176,7 @@ function renderAskLog() {
     if (entry.loading) {
       return `<div class="askEntry"><div class="askQ">${escapeHtml(entry.question)}</div><div class="askA loading">Thinking…</div></div>`;
     }
-    if (entry.error) {
+    if (entry.error && !entry.answer) {
       return `<div class="askEntry"><div class="askQ">${escapeHtml(entry.question)}</div><div class="askA error">${escapeHtml(entry.error)}</div></div>`;
     }
     const metaParts = [];
@@ -184,36 +184,70 @@ function renderAskLog() {
     if (typeof entry.confidence === 'number') metaParts.push(`${Math.round(entry.confidence * 100)}%`);
     const meta = metaParts.length ? `<div class="askMeta"><span>${metaParts.join('</span><span>')}</span></div>` : '';
     const follow = entry.follow_up ? `<div class="follow">Follow-up · ${escapeHtml(entry.follow_up)}</div>` : '';
-    return `<div class="askEntry"><div class="askQ">${escapeHtml(entry.question)}</div><div class="askA">${escapeHtml(entry.answer)}</div>${follow}${meta}</div>`;
+    const cursor = entry.streaming ? '<span class="cursor">▍</span>' : '';
+    return `<div class="askEntry"><div class="askQ">${escapeHtml(entry.question)}</div><div class="askA">${escapeHtml(entry.answer)}${cursor}</div>${follow}${meta}</div>`;
   }).join('');
   scrollArea.scrollTop = scrollArea.scrollHeight;
 }
 
 async function submitAsk(question) {
-  const entry = { question, loading: true };
+  const entry = { question, loading: true, answer: '' };
   askHistory.push(entry);
   renderAskLog();
 
   try {
-    const response = await apiFetch('/ask', {
+    const response = await apiFetch('/ask/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ question })
     });
-    const data = await response.json().catch(() => null);
-    if (!response.ok) {
+    if (!response.ok || !response.body) {
+      const data = await response.json().catch(() => null);
       entry.loading = false;
       entry.error = (data && data.detail) || 'Could not get an answer. Try again.';
-    } else {
-      entry.loading = false;
-      entry.answer = data.answer || '';
-      entry.confidence = data.confidence;
-      entry.follow_up = data.follow_up;
-      entry.source = data.sources && data.sources[0] ? data.sources[0].filename : null;
+      renderAskLog();
+      return;
+    }
+
+    entry.loading = false;
+    entry.streaming = true;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let sepIndex;
+      while ((sepIndex = buffer.indexOf('\n\n')) !== -1) {
+        const rawEvent = buffer.slice(0, sepIndex);
+        buffer = buffer.slice(sepIndex + 2);
+        const eventLine = rawEvent.split('\n').find((l) => l.startsWith('event: '));
+        const dataLine = rawEvent.split('\n').find((l) => l.startsWith('data: '));
+        if (!eventLine || !dataLine) continue;
+        const eventType = eventLine.slice('event: '.length).trim();
+        let payload;
+        try { payload = JSON.parse(dataLine.slice('data: '.length)); } catch (_) { continue; }
+
+        if (eventType === 'sources') {
+          entry.confidence = payload.confidence;
+          entry.source = payload.sources && payload.sources[0] ? payload.sources[0].filename : null;
+        } else if (eventType === 'delta') {
+          entry.answer += payload.text;
+        } else if (eventType === 'done') {
+          entry.streaming = false;
+          entry.answer = payload.answer;
+          entry.confidence = payload.confidence;
+          entry.follow_up = payload.follow_up;
+        }
+        renderAskLog();
+      }
     }
   } catch (_) {
     entry.loading = false;
-    entry.error = 'CallPilot backend is unreachable.';
+    entry.streaming = false;
+    if (!entry.answer) entry.error = 'CallPilot backend is unreachable.';
   }
   renderAskLog();
 }

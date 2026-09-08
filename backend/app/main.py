@@ -17,7 +17,7 @@ import requests
 from docx import Document
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from lxml import html as lxml_html
 from pydantic import BaseModel
 from pypdf import PdfReader
@@ -42,6 +42,27 @@ except Exception:
 
 _LOCAL_WHISPER_MODEL = None
 _LOCAL_WHISPER_LOCK = threading.Lock()
+
+# Reuse one SDK client (and its underlying HTTP connection pool) across
+# requests instead of paying a fresh TCP/TLS handshake to the provider on
+# every single question — that overhead alone was adding real latency to
+# time-to-first-token on a live call.
+_OPENAI_CLIENT = None
+_ANTHROPIC_CLIENT = None
+
+
+def get_openai_client():
+    global _OPENAI_CLIENT
+    if _OPENAI_CLIENT is None:
+        _OPENAI_CLIENT = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    return _OPENAI_CLIENT
+
+
+def get_anthropic_client():
+    global _ANTHROPIC_CLIENT
+    if _ANTHROPIC_CLIENT is None:
+        _ANTHROPIC_CLIENT = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    return _ANTHROPIC_CLIENT
 
 def local_whisper_available() -> bool:
     return WhisperModel is not None
@@ -698,7 +719,7 @@ def build_prompt(question: str, results: List[dict], call_context: Optional[str]
         for i, r in enumerate(results)
     )
     style_instruction = {
-        "short": "Keep the answer to 2-4 short sentences suitable for speaking live.",
+        "short": "Keep the answer to 1-3 short sentences (well under 60 words) suitable for speaking live on a call.",
         "detailed": "Give a concise but complete answer in 1-3 short paragraphs.",
         "technical": "Give a technical answer with concrete implementation details, constraints, and terminology while remaining concise.",
     }[style]
@@ -721,7 +742,7 @@ def llm_answer(question: str, results: List[dict], call_context: Optional[str], 
     system, user = build_prompt(question, results, call_context, style)
     try:
         if provider == "openai":
-            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            client = get_openai_client()
             resp = client.chat.completions.create(
                 model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
                 temperature=0.1,
@@ -729,10 +750,14 @@ def llm_answer(question: str, results: List[dict], call_context: Optional[str], 
             )
             text = (resp.choices[0].message.content or "").strip()
         else:
-            client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+            client = get_anthropic_client()
+            # Generation time scales with max_tokens even when the model stops
+            # early, so cap it per style instead of a flat 900 — the "short"
+            # answers used live on calls don't need headroom for a full essay.
+            token_cap = {"short": 220, "detailed": 500, "technical": 700}.get(style, 500)
             resp = client.messages.create(
                 model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
-                max_tokens=900,
+                max_tokens=token_cap,
                 temperature=0.1,
                 system=system,
                 messages=[{"role": "user", "content": user}],
@@ -788,7 +813,7 @@ def llm_detect_question(transcript: str, provider: str) -> tuple[bool, Optional[
     user = f"TRANSCRIPT (most recent last):\n{transcript.strip()[-3000:]}"
     try:
         if provider == "openai":
-            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            client = get_openai_client()
             resp = client.chat.completions.create(
                 model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
                 temperature=0, max_tokens=80,
@@ -796,7 +821,7 @@ def llm_detect_question(transcript: str, provider: str) -> tuple[bool, Optional[
             )
             text = (resp.choices[0].message.content or "").strip()
         else:
-            client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+            client = get_anthropic_client()
             resp = client.messages.create(
                 model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
                 max_tokens=80, temperature=0,
@@ -1166,6 +1191,92 @@ def ask(req: AskRequest):
     return AskResponse(answer=answer, confidence=round(confidence, 2), sources=sources, follow_up=follow, mode=f"{provider}+rag", provider=provider, question=question)
 
 
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.post("/ask/stream")
+def ask_stream(req: AskRequest):
+    # For a live call, waiting 2-5s to see anything reads as "broken" even
+    # though the answer is on its way. This streams raw text as Claude/OpenAI
+    # generates it so something appears within a few hundred ms; the client
+    # swaps in the cleanly-parsed final text (follow-up split out) once the
+    # `done` event arrives. Falls back to demo/extractive mode on any
+    # provider error, same as the non-streaming /ask.
+    question = req.question.strip()
+    if len(question) < 3:
+        raise HTTPException(status_code=400, detail="Question is too short")
+    results = retrieve(question, req.top_k)
+
+    def gen():
+        if not results:
+            msg = "Your knowledge base is empty."
+            log_qa(question, msg, 0, "demo", [], None)
+            yield _sse("done", {"answer": msg, "confidence": 0, "sources": [], "follow_up": None, "mode": "empty", "provider": "demo", "question": question})
+            return
+
+        top = results[0]["score"] if results else 0
+        confidence = round(min(0.98, max(0.0, 0.25 + top * 2.1)) if top > 0 else 0.0, 2)
+        sources = [
+            Source(
+                document_id=r["document_id"], filename=r["filename"], chunk_index=r["chunk_index"],
+                score=round(r["score"], 4), excerpt=(r["content"][:520] + "…") if len(r["content"]) > 520 else r["content"],
+                url=r.get("url"),
+            ) for r in results if r["score"] > 0
+        ]
+        yield _sse("sources", {"sources": [s.model_dump() for s in sources], "confidence": confidence})
+
+        provider = resolve_provider(req.provider)
+
+        def fallback():
+            answer, follow = demo_answer(question, results, req.answer_style)
+            log_qa(question, answer, confidence, "demo", sources, follow)
+            yield _sse("delta", {"text": answer})
+            yield _sse("done", {"answer": answer, "confidence": confidence, "follow_up": follow, "mode": "demo+rag", "provider": "demo", "question": question})
+
+        if provider == "demo":
+            yield from fallback()
+            return
+
+        system, user = build_prompt(question, results, req.call_context, req.answer_style)
+        full_text = ""
+        try:
+            if provider == "openai":
+                client = get_openai_client()
+                stream = client.chat.completions.create(
+                    model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"), temperature=0.1, stream=True,
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                )
+                for chunk in stream:
+                    piece = chunk.choices[0].delta.content if chunk.choices else None
+                    if piece:
+                        full_text += piece
+                        yield _sse("delta", {"text": piece})
+            else:
+                client = get_anthropic_client()
+                token_cap = {"short": 220, "detailed": 500, "technical": 700}.get(req.answer_style, 500)
+                with client.messages.stream(
+                    model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
+                    max_tokens=token_cap, temperature=0.1, system=system,
+                    messages=[{"role": "user", "content": user}],
+                ) as stream:
+                    for piece in stream.text_stream:
+                        full_text += piece
+                        yield _sse("delta", {"text": piece})
+        except Exception:
+            yield from fallback()
+            return
+
+        text, follow = full_text, None
+        if "FOLLOW_UP:" in text:
+            text, follow = text.split("FOLLOW_UP:", 1)
+            text, follow = text.strip(), follow.strip()
+        log_qa(question, text, confidence, provider, sources, follow)
+        yield _sse("done", {"answer": text, "confidence": confidence, "follow_up": follow, "mode": f"{provider}+rag", "provider": provider, "question": question})
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
 @app.post("/detect-question")
 def detect_question(req: DetectRequest):
     provider = resolve_provider(req.provider)
@@ -1190,7 +1301,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
         if requested == "openai":
             if not provider_status()["openai"]:
                 raise HTTPException(status_code=400, detail="OpenAI transcription selected but OPENAI_API_KEY is not configured")
-            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            client = get_openai_client()
             with temp_path.open("rb") as fh:
                 result = client.audio.transcriptions.create(model=os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe"), file=fh)
             text = getattr(result, "text", "") or ""
