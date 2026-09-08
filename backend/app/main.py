@@ -52,13 +52,32 @@ def get_local_whisper_model():
         raise RuntimeError("Local Whisper is not installed")
     with _LOCAL_WHISPER_LOCK:
         if _LOCAL_WHISPER_MODEL is None:
-            model_name = os.getenv("LOCAL_WHISPER_MODEL", "base.en")
+            # small.en tracks accented/non-native English speech noticeably
+            # better than base.en (greedy beam_size=1 also hurt accuracy more
+            # than it helped speed for short call segments) — worth the extra
+            # CPU for a live sales call where mishearing a question is costly.
+            model_name = os.getenv("LOCAL_WHISPER_MODEL", "small.en")
             _LOCAL_WHISPER_MODEL = WhisperModel(model_name, device="cpu", compute_type="int8")
     return _LOCAL_WHISPER_MODEL
 
+# Biases Whisper's decoder toward the product/technical vocabulary it'll
+# actually hear on these calls (brand and tool names in particular are where
+# accent + jargon combine to trip transcription up the most).
+WHISPER_VOCAB_PROMPT = (
+    "LambdaTest, HyperExecute, KaneAI, SmartUI, Selenium, Cypress, Playwright, "
+    "Appium, TestCafe, WebDriverIO, Jenkins, GitHub Actions, CircleCI, Jira, "
+    "cross-browser testing, real device cloud, visual regression testing, "
+    "accessibility testing, geolocation testing, LambdaTest Tunnel, SOC 2, "
+    "single sign-on, SAML, proof of concept, POC, SLA."
+)
+
+
 def transcribe_local(path: Path) -> str:
     model = get_local_whisper_model()
-    segments, _info = model.transcribe(str(path), vad_filter=True, beam_size=1)
+    segments, _info = model.transcribe(
+        str(path), vad_filter=True, beam_size=5,
+        initial_prompt=WHISPER_VOCAB_PROMPT, condition_on_previous_text=False,
+    )
     return " ".join(seg.text.strip() for seg in segments if seg.text.strip()).strip()
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -154,6 +173,17 @@ def init_db() -> None:
                 path_prefix TEXT NOT NULL,
                 last_synced_at DATETIME,
                 last_synced_pages INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS qa_log (
+                id TEXT PRIMARY KEY,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                confidence REAL,
+                provider TEXT,
+                source_filename TEXT,
+                source_url TEXT,
+                follow_up TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
             """
         )
@@ -485,6 +515,18 @@ class AskResponse(BaseModel):
     question: str
 
 
+class QaLogEntry(BaseModel):
+    id: str
+    question: str
+    answer: str
+    confidence: Optional[float] = None
+    provider: Optional[str] = None
+    source_filename: Optional[str] = None
+    source_url: Optional[str] = None
+    follow_up: Optional[str] = None
+    created_at: str
+
+
 class DetectRequest(BaseModel):
     transcript: str
     provider: Literal["auto", "openai", "claude", "demo"] = "auto"
@@ -562,7 +604,7 @@ def provider_status() -> dict:
         "claude_model": os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
         "transcription_model": os.getenv("TRANSCRIPTION_PROVIDER", "local"),
         "local_transcription": local_whisper_available(),
-        "local_whisper_model": os.getenv("LOCAL_WHISPER_MODEL", "base.en"),
+        "local_whisper_model": os.getenv("LOCAL_WHISPER_MODEL", "small.en"),
     }
 
 
@@ -1078,6 +1120,28 @@ def _auto_sync_on_startup() -> None:
         start_web_sync()
 
 
+def log_qa(question: str, answer: str, confidence: float, provider: str, sources: List["Source"], follow_up: Optional[str]) -> None:
+    # Best-effort call history so a rep can look back at what was asked/answered
+    # during a call. Every /ask call goes through here regardless of whether it
+    # came from the overlay's manual ask box, live auto-detected questions, or
+    # the dashboard — one insert point covers all three.
+    try:
+        top_source = sources[0] if sources else None
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO qa_log (id, question, answer, confidence, provider, source_filename, source_url, follow_up) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(uuid.uuid4()), question, answer, confidence, provider,
+                    top_source.filename if top_source else None,
+                    top_source.url if top_source else None,
+                    follow_up,
+                ),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
     question = req.question.strip()
@@ -1085,7 +1149,9 @@ def ask(req: AskRequest):
         raise HTTPException(status_code=400, detail="Question is too short")
     results = retrieve(question, req.top_k)
     if not results:
-        return AskResponse(answer="Your knowledge base is empty.", confidence=0, sources=[], mode="empty", provider="demo", question=question)
+        empty = AskResponse(answer="Your knowledge base is empty.", confidence=0, sources=[], mode="empty", provider="demo", question=question)
+        log_qa(question, empty.answer, 0, "demo", [], None)
+        return empty
     answer, follow, provider = llm_answer(question, results, req.call_context, req.provider, req.answer_style)
     top = results[0]["score"] if results else 0
     confidence = min(0.98, max(0.0, 0.25 + top * 2.1)) if top > 0 else 0.0
@@ -1096,6 +1162,7 @@ def ask(req: AskRequest):
             url=r.get("url"),
         ) for r in results if r["score"] > 0
     ]
+    log_qa(question, answer, round(confidence, 2), provider, sources, follow)
     return AskResponse(answer=answer, confidence=round(confidence, 2), sources=sources, follow_up=follow, mode=f"{provider}+rag", provider=provider, question=question)
 
 
@@ -1138,6 +1205,39 @@ async def transcribe_audio(file: UploadFile = File(...)):
         return {"text": text.strip(), "question": heuristic_question(text), "transcription_provider": used}
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+@app.get("/qa-log", response_model=List[QaLogEntry])
+def list_qa_log(limit: int = 200, before: Optional[str] = None):
+    limit = max(1, min(limit, 500))
+    with db() as conn:
+        if before:
+            rows = conn.execute(
+                "SELECT * FROM qa_log WHERE created_at < ? ORDER BY created_at DESC LIMIT ?",
+                (before, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM qa_log ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.delete("/qa-log/{entry_id}")
+def delete_qa_log_entry(entry_id: str):
+    with db() as conn:
+        row = conn.execute("SELECT id FROM qa_log WHERE id=?", (entry_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Entry not found")
+        conn.execute("DELETE FROM qa_log WHERE id=?", (entry_id,))
+        conn.commit()
+    return {"deleted": True}
+
+
+@app.delete("/qa-log")
+def clear_qa_log():
+    with db() as conn:
+        conn.execute("DELETE FROM qa_log")
+        conn.commit()
+    return {"cleared": True}
 
 
 @app.post("/sessions")
