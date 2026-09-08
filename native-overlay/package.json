@@ -7,7 +7,8 @@
   "scripts": {
     "start": "electron .",
     "test": "node --test meetingLifecycle.test.cjs",
-    "dist": "electron-builder --mac --dir --universal"
+    "dist": "electron-builder --mac --dir --universal",
+    "postdist": "codesign --deep --force --sign - \"dist/mac-universal/CallPilot AI.app\""
   },
   "devDependencies": { "electron": "^44.0.0", "electron-builder": "^25.1.8" },
   "build": {
