@@ -106,6 +106,62 @@ function renderCallStatus(status) {
 window.callpilot.getCallStatus().then(renderCallStatus);
 window.callpilot.onCallStatus(renderCallStatus);
 
+// -- Permissions: mac ties access grants to this exact build's signature, and
+// there's no OS push event for "the user just flipped a toggle in System
+// Settings" — so this polls while the panel is open (cheap, local IPC calls)
+// and reflects whatever the OS reports right now, including a grant that
+// happened seconds ago in another window, no relaunch needed to *see* it
+// update here (starting a call after a screen-recording grant still needs a
+// fresh process on some macOS versions — that's an OS limitation, not this).
+const permBlock = document.getElementById('permBlock');
+const permBadge = document.getElementById('permBadge');
+const permRows = { microphone: document.getElementById('permMic'), screen: document.getElementById('permScreen') };
+
+function setPermRow(row, status) {
+  const granted = status === 'granted';
+  const denied = status === 'denied' || status === 'restricted';
+  row.querySelector('.permDot').className = `permDot ${granted ? 'ok' : denied ? 'denied' : 'pending'}`;
+  const btn = row.querySelector('.permBtn');
+  btn.textContent = granted ? 'Granted' : denied ? 'Open Settings' : 'Enable';
+  btn.disabled = granted;
+  btn.classList.toggle('ok', granted);
+}
+
+function renderPermissions(status) {
+  if (!status) return;
+  const micOk = status.mic === 'granted';
+  const screenOk = status.screen === 'granted';
+  setPermRow(permRows.microphone, status.mic);
+  setPermRow(permRows.screen, status.screen);
+  const allGranted = micOk && screenOk;
+  permBlock.hidden = allGranted;
+  permBadge.hidden = allGranted;
+  return allGranted;
+}
+
+async function refreshPermissions() {
+  try {
+    renderPermissions(await window.callpilot.getPermissions());
+  } catch (_) { /* transient IPC hiccup; next poll tick will retry */ }
+}
+
+Object.values(permRows).forEach((row) => {
+  row.querySelector('.permBtn').addEventListener('click', async () => {
+    const btn = row.querySelector('.permBtn');
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = 'Requesting…';
+    try {
+      renderPermissions(await window.callpilot.requestPermission(row.dataset.kind));
+    } finally {
+      if (btn.textContent === 'Requesting…') { btn.disabled = false; btn.textContent = 'Enable'; }
+    }
+  });
+});
+
+refreshPermissions();
+setInterval(refreshPermissions, 3000);
+
 function renderState(data) {
   const hasAnswer = !!(data && data.visible && (data.question || data.answer));
   empty.hidden = hasAnswer;

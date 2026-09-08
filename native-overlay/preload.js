@@ -7,5 +7,7 @@ contextBridge.exposeInMainWorld('callpilot', {
   onMode: (callback) => ipcRenderer.on('overlay-mode', (_event, payload) => callback(payload)),
   getCallStatus: () => ipcRenderer.invoke('get-call-status'),
   onCallStatus: (callback) => ipcRenderer.on('call-status', (_event, payload) => callback(payload)),
-  apiConfig: () => ipcRenderer.invoke('get-api-config')
+  apiConfig: () => ipcRenderer.invoke('get-api-config'),
+  getPermissions: () => ipcRenderer.invoke('get-permissions'),
+  requestPermission: (kind) => ipcRenderer.invoke('request-permission', kind)
 });

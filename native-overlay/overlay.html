@@ -9,6 +9,7 @@
   <button id="bubble" class="bubble" aria-label="Open CallPilot">
     <span class="spark">✦</span>
     <span id="unread" class="unread" hidden></span>
+    <span id="permBadge" class="permBadge" hidden title="Permissions needed"></span>
   </button>
 
   <main id="panel" class="panel" hidden>
@@ -26,6 +27,26 @@
         <div id="emptyIcon" class="emptyIcon">✦</div>
         <div id="emptyTitle" class="emptyTitle">CallPilot is ready</div>
         <div id="emptyHint" class="emptyHint">Click Start Call from the CallPilot menu bar icon when you're on a call.</div>
+
+        <div id="permBlock" class="permBlock" hidden>
+          <div class="permHead">Needs access to start a call</div>
+          <div class="permRow" id="permMic" data-kind="microphone">
+            <span class="permIcon">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1M12 18v4"/></svg>
+            </span>
+            <span class="permLabel">Microphone</span>
+            <span class="permDot"></span>
+            <button class="permBtn" type="button">Enable</button>
+          </div>
+          <div class="permRow" id="permScreen" data-kind="screen">
+            <span class="permIcon">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2.5" y="4" width="19" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+            </span>
+            <span class="permLabel">Screen &amp; System Audio</span>
+            <span class="permDot"></span>
+            <button class="permBtn" type="button">Enable</button>
+          </div>
+        </div>
       </section>
 
       <section id="content" hidden>

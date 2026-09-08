@@ -130,8 +130,8 @@ function rebuildTrayMenu() {
   const template = [
     { label: statusText(), enabled: false },
     { type: 'separator' },
-    { label: 'Start Call', enabled: !callActive && !captureStarting, click: () => startCall('menu') },
-    { label: 'Stop Call', enabled: callActive || captureStarting, click: () => stopCall('manual') },
+    { label: 'Start Call', accelerator: 'Alt+Shift+Space', enabled: !callActive && !captureStarting, click: () => startCall('menu') },
+    { label: 'Stop Call', accelerator: 'Alt+Shift+Space', enabled: callActive || captureStarting, click: () => stopCall('manual') },
     { type: 'separator' },
     { label: expanded ? 'Minimize Assistant' : 'Open Assistant', click: () => applyMode(!expanded) },
     { label: 'Test Backend', click: () => checkBackend(true) },
@@ -332,6 +332,11 @@ app.whenReady().then(async () => {
   tray.on('click', () => tray.popUpContextMenu());
   rebuildTrayMenu();
   globalShortcut.register('Alt+Space', () => applyMode(!expanded));
+  // macOS can bury a menu bar icon in its own overflow when the bar is
+  // crowded (Control Center settings, or tools like Bartender) — that's OS
+  // behavior with no app-level override, so this is the guaranteed way in
+  // regardless of whether the tray icon is currently visible.
+  globalShortcut.register('Alt+Shift+Space', () => { if (callActive || captureStarting) stopCall('manual'); else startCall('shortcut'); });
   setInterval(monitorMeetings, MEETING_POLL_MS);
   setTimeout(monitorMeetings, 1500);
 });
@@ -344,6 +349,41 @@ ipcMain.handle('platform-info', () => ({
   guarantee: process.platform === 'win32' ? 'best-supported' : process.platform === 'darwin' ? 'not-guaranteed' : 'unsupported'
 }));
 ipcMain.handle('get-call-status', () => computeCallStatus());
+
+function getPermissionStatus() {
+  if (process.platform !== 'darwin') return { mic: 'granted', screen: 'granted' };
+  return {
+    mic: systemPreferences.getMediaAccessStatus('microphone'),
+    screen: systemPreferences.getMediaAccessStatus('screen')
+  };
+}
+ipcMain.handle('get-permissions', () => getPermissionStatus());
+ipcMain.handle('request-permission', async (_event, kind) => {
+  if (process.platform !== 'darwin') return getPermissionStatus();
+  if (kind === 'microphone') {
+    let status = systemPreferences.getMediaAccessStatus('microphone');
+    if (status === 'not-determined') {
+      try { await systemPreferences.askForMediaAccess('microphone'); } catch (_) {}
+      status = systemPreferences.getMediaAccessStatus('microphone');
+    }
+    if (status !== 'granted') {
+      try { shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone'); } catch (_) {}
+    }
+  } else if (kind === 'screen') {
+    let status = systemPreferences.getMediaAccessStatus('screen');
+    if (status === 'not-determined') {
+      // No askForMediaAccess() exists for screen recording — an actual
+      // capture attempt is what registers the app with TCC and triggers
+      // the system prompt.
+      try { await desktopCapturer.getSources({ types: ['screen'] }); } catch (_) {}
+      status = systemPreferences.getMediaAccessStatus('screen');
+    }
+    if (status !== 'granted') {
+      try { shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'); } catch (_) {}
+    }
+  }
+  return getPermissionStatus();
+});
 ipcMain.on('set-overlay-expanded', (_event, value) => applyMode(!!value));
 ipcMain.on('hide-overlay', () => applyMode(false));
 ipcMain.on('drag-overlay', (_event, { dx, dy }) => {
