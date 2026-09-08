@@ -7,15 +7,18 @@ import shutil
 import sqlite3
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import List, Optional, Literal
 
 import numpy as np
+import requests
 from docx import Document
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from lxml import html as lxml_html
 from pydantic import BaseModel
 from pypdf import PdfReader
 from dotenv import load_dotenv
@@ -76,6 +79,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# When deployed somewhere reachable beyond localhost, BACKEND_ACCESS_TOKEN gates
+# every request behind a shared app key so the (billed) LLM provider and the
+# Confluence-sourced knowledge base aren't left open on the public internet.
+# Unset (the local-dev default) means no gate, matching prior behavior.
+BACKEND_ACCESS_TOKEN = os.getenv("BACKEND_ACCESS_TOKEN", "").strip()
+
+
+@app.middleware("http")
+async def require_access_token(request, call_next):
+    if BACKEND_ACCESS_TOKEN and request.method != "OPTIONS" and request.url.path != "/health":
+        if request.headers.get("x-callpilot-key", "") != BACKEND_ACCESS_TOKEN:
+            return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    return await call_next(request)
+
 
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -108,6 +125,24 @@ def init_db() -> None:
                 context TEXT,
                 transcript TEXT DEFAULT '',
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS confluence_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                base_url TEXT NOT NULL,
+                email TEXT NOT NULL,
+                api_token TEXT NOT NULL,
+                space_key TEXT NOT NULL,
+                space_name TEXT,
+                last_synced_at DATETIME,
+                last_synced_pages INTEGER DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS web_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                label TEXT NOT NULL,
+                sitemap_url TEXT NOT NULL,
+                path_prefix TEXT NOT NULL,
+                last_synced_at DATETIME,
+                last_synced_pages INTEGER DEFAULT 0
             );
             """
         )
@@ -188,12 +223,200 @@ def index_file(path: Path, filename: str, source_type: str = "upload") -> dict:
     return {"id": doc_id, "filename": filename, "chunks": len(chunks), "source_type": source_type}
 
 
+def get_confluence_config() -> Optional[dict]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM confluence_config WHERE id=1").fetchone()
+    if row:
+        return dict(row)
+    base_url = os.getenv("CONFLUENCE_BASE_URL")
+    email = os.getenv("CONFLUENCE_EMAIL")
+    api_token = os.getenv("CONFLUENCE_API_TOKEN")
+    space_key = os.getenv("CONFLUENCE_SPACE_KEY")
+    if base_url and email and api_token and space_key:
+        return {
+            "base_url": base_url.rstrip("/"), "email": email, "api_token": api_token, "space_key": space_key,
+            "space_name": None, "last_synced_at": None, "last_synced_pages": 0,
+        }
+    return None
+
+
+def confluence_api_get(base_url: str, email: str, api_token: str, path: str, params: Optional[dict] = None) -> dict:
+    if path.startswith("http"):
+        url = path
+    elif path.startswith("/wiki/api/v2"):
+        url = f"{base_url.rstrip('/')}{path}"
+    else:
+        url = f"{base_url.rstrip('/')}/wiki/api/v2{path}"
+    resp = requests.get(url, params=params, auth=(email, api_token), headers={"Accept": "application/json"}, timeout=20)
+    if resp.status_code == 401:
+        raise ValueError("Confluence rejected the email/API token (401 Unauthorized).")
+    if resp.status_code == 403:
+        raise ValueError("This Confluence account does not have access to that space (403 Forbidden).")
+    if resp.status_code == 404:
+        raise ValueError("Confluence space not found. Check the site URL and space key.")
+    resp.raise_for_status()
+    return resp.json()
+
+
+def confluence_find_space(base_url: str, email: str, api_token: str, space_key: str) -> dict:
+    data = confluence_api_get(base_url, email, api_token, "/spaces", {"keys": space_key, "limit": 1})
+    results = data.get("results") or []
+    if not results:
+        raise ValueError(f"No space found with key '{space_key}'.")
+    return results[0]
+
+
+def confluence_fetch_pages(base_url: str, email: str, api_token: str, space_id: str) -> List[dict]:
+    pages: List[dict] = []
+    path = f"/spaces/{space_id}/pages"
+    params: Optional[dict] = {"body-format": "storage", "limit": 100, "status": "current"}
+    while True:
+        data = confluence_api_get(base_url, email, api_token, path, params)
+        pages.extend(data.get("results") or [])
+        next_link = (data.get("_links") or {}).get("next")
+        if not next_link:
+            break
+        path, params = next_link, None
+    return pages
+
+
+def html_to_text(raw_html: str) -> str:
+    if not raw_html or not raw_html.strip():
+        return ""
+    try:
+        text = lxml_html.fromstring(f"<div>{raw_html}</div>").text_content()
+    except Exception:
+        text = re.sub(r"<[^>]+>", " ", raw_html)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+
+def index_confluence_page(page: dict, base_url: str, space_key: str) -> Optional[dict]:
+    title = page.get("title") or "Untitled page"
+    body = ((page.get("body") or {}).get("storage") or {}).get("value") or ""
+    text = html_to_text(body)
+    if not text:
+        return None
+    chunks = chunk_text(f"{title}\n\n{text}")
+    if not chunks:
+        return None
+    webui = ((page.get("_links") or {}).get("webui")) or ""
+    page_url = f"{base_url.rstrip('/')}/wiki{webui}" if webui and not webui.startswith("http") else (webui or base_url)
+    doc_id = str(uuid.uuid4())
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO documents (id, filename, path, source_type) VALUES (?, ?, ?, ?)",
+            (doc_id, f"[{space_key}] {title}", page_url, "confluence"),
+        )
+        conn.executemany(
+            "INSERT INTO chunks (id, document_id, chunk_index, content) VALUES (?, ?, ?, ?)",
+            [(str(uuid.uuid4()), doc_id, i, c) for i, c in enumerate(chunks)],
+        )
+        conn.commit()
+    return {"id": doc_id, "filename": title, "chunks": len(chunks)}
+
+
+def clear_confluence_documents() -> None:
+    with db() as conn:
+        ids = [r["id"] for r in conn.execute("SELECT id FROM documents WHERE source_type='confluence'").fetchall()]
+        for did in ids:
+            conn.execute("DELETE FROM chunks WHERE document_id=?", (did,))
+            conn.execute("DELETE FROM documents WHERE id=?", (did,))
+        conn.commit()
+
+
+WEB_USER_AGENT = "CallPilotBot/1.0 (+internal sales-engineering knowledge sync)"
+MAX_WEB_PAGES = 600
+
+
+def get_web_config() -> Optional[dict]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM web_config WHERE id=1").fetchone()
+    return dict(row) if row else None
+
+
+def fetch_sitemap_urls(sitemap_url: str, path_prefix: str, timeout: int = 20) -> List[str]:
+    resp = requests.get(sitemap_url, headers={"User-Agent": WEB_USER_AGENT}, timeout=timeout)
+    resp.raise_for_status()
+    locs = re.findall(r"<loc>\s*(.*?)\s*</loc>", resp.text)
+    return [u for u in locs if path_prefix in u]
+
+
+def fetch_web_page_text(url: str, timeout: int = 20) -> tuple[str, str]:
+    resp = requests.get(url, headers={"User-Agent": WEB_USER_AGENT}, timeout=timeout)
+    resp.raise_for_status()
+    tree = lxml_html.fromstring(resp.content)
+    # Grab the title before stripping noise — a doc's own <h1> is often
+    # wrapped in a semantic <header> used for the title block, not site nav,
+    # so stripping headers first would take the real title down with it.
+    h1 = tree.xpath("//h1")
+    title = h1[0].text_content().strip() if h1 else ""
+    if not title:
+        title_tag = tree.xpath("//title/text()")
+        title = title_tag[0].strip() if title_tag else url
+    for bad in tree.xpath(
+        '//script | //style | //nav | //footer | //header '
+        '| //*[contains(@class,"toc")] | //*[contains(@class,"sidebar")] | //*[contains(@class,"breadcrumb")]'
+    ):
+        parent = bad.getparent()
+        if parent is not None:
+            parent.remove(bad)
+    candidates = (
+        tree.xpath('//*[contains(@class,"theme-doc-markdown")]')
+        or tree.xpath("//article")
+        or tree.xpath("//main")
+    )
+    node = candidates[0] if candidates else tree
+    text = node.text_content()
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    return title, text.strip()
+
+
+def index_web_page(url: str, label: str) -> Optional[dict]:
+    try:
+        title, text = fetch_web_page_text(url)
+    except Exception:
+        return None
+    if not text or len(text) < 40:
+        return None
+    chunks = chunk_text(f"{title}\n\n{text}")
+    if not chunks:
+        return None
+    doc_id = str(uuid.uuid4())
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO documents (id, filename, path, source_type) VALUES (?, ?, ?, ?)",
+            (doc_id, f"[{label}] {title}", url, "web"),
+        )
+        conn.executemany(
+            "INSERT INTO chunks (id, document_id, chunk_index, content) VALUES (?, ?, ?, ?)",
+            [(str(uuid.uuid4()), doc_id, i, c) for i, c in enumerate(chunks)],
+        )
+        conn.commit()
+    return {"id": doc_id, "filename": title, "chunks": len(chunks)}
+
+
+def clear_web_documents() -> None:
+    with db() as conn:
+        ids = [r["id"] for r in conn.execute("SELECT id FROM documents WHERE source_type='web'").fetchall()]
+        for did in ids:
+            conn.execute("DELETE FROM chunks WHERE document_id=?", (did,))
+            conn.execute("DELETE FROM documents WHERE id=?", (did,))
+        conn.commit()
+
+
 def seed_demo_data(force: bool = False) -> int:
     if not DEMO_DIR.exists():
         return 0
     with db() as conn:
         existing = conn.execute("SELECT COUNT(*) AS c FROM documents WHERE source_type='demo'").fetchone()["c"]
-    if existing and not force:
+        other = conn.execute("SELECT COUNT(*) AS c FROM documents WHERE source_type!='demo'").fetchone()["c"]
+    # Once real content exists (an upload, or a connected Confluence sync), stop
+    # auto-seeding the fictional Nimbus demo docs on every startup. `force=True`
+    # (the sidebar's "Reset demo data" button) still works either way.
+    if not force and (existing or other):
         return 0
     if force:
         with db() as conn:
@@ -227,6 +450,7 @@ class Source(BaseModel):
     chunk_index: int
     score: float
     excerpt: str
+    url: Optional[str] = None
 
 
 class AskResponse(BaseModel):
@@ -254,6 +478,38 @@ class TranscriptRequest(BaseModel):
     text: str
 
 
+class ConfluenceConnectRequest(BaseModel):
+    base_url: str
+    email: str
+    api_token: str
+    space_key: str
+
+
+class ConfluenceStatus(BaseModel):
+    connected: bool
+    base_url: Optional[str] = None
+    email: Optional[str] = None
+    space_key: Optional[str] = None
+    space_name: Optional[str] = None
+    last_synced_at: Optional[str] = None
+    last_synced_pages: int = 0
+
+
+class WebConnectRequest(BaseModel):
+    sitemap_url: str
+    path_prefix: str
+    label: str = "Docs"
+
+
+class WebStatus(BaseModel):
+    connected: bool
+    label: Optional[str] = None
+    sitemap_url: Optional[str] = None
+    path_prefix: Optional[str] = None
+    last_synced_at: Optional[str] = None
+    last_synced_pages: int = 0
+
+
 class OverlayPushRequest(BaseModel):
     question: str
     answer: str
@@ -277,7 +533,7 @@ def provider_status() -> dict:
         "claude": bool(os.getenv("ANTHROPIC_API_KEY") and Anthropic is not None),
         "demo": True,
         "openai_model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-        "claude_model": os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest"),
+        "claude_model": os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
         "transcription_model": os.getenv("TRANSCRIPTION_PROVIDER", "local"),
         "local_transcription": local_whisper_available(),
         "local_whisper_model": os.getenv("LOCAL_WHISPER_MODEL", "base.en"),
@@ -305,7 +561,7 @@ def retrieve(question: str, top_k: int = 5) -> List[dict]:
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT c.document_id, c.chunk_index, c.content, d.filename
+            SELECT c.document_id, c.chunk_index, c.content, d.filename, d.path, d.source_type
             FROM chunks c JOIN documents d ON d.id = c.document_id
             ORDER BY d.created_at DESC, c.chunk_index ASC
             """
@@ -324,6 +580,7 @@ def retrieve(question: str, top_k: int = 5) -> List[dict]:
             "chunk_index": rows[int(i)]["chunk_index"],
             "content": rows[int(i)]["content"],
             "score": float(scores[int(i)]),
+            "url": rows[int(i)]["path"] if rows[int(i)]["source_type"] in ("confluence", "web") else None,
         }
         for i in ranked
     ]
@@ -372,24 +629,30 @@ def llm_answer(question: str, results: List[dict], call_context: Optional[str], 
         return answer, follow, provider
 
     system, user = build_prompt(question, results, call_context, style)
-    if provider == "openai":
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        resp = client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-            temperature=0.1,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        )
-        text = (resp.choices[0].message.content or "").strip()
-    else:
-        client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        resp = client.messages.create(
-            model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest"),
-            max_tokens=900,
-            temperature=0.1,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-        text = "".join(block.text for block in resp.content if getattr(block, "type", "") == "text").strip()
+    try:
+        if provider == "openai":
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            resp = client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+                temperature=0.1,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            )
+            text = (resp.choices[0].message.content or "").strip()
+        else:
+            client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+            resp = client.messages.create(
+                model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
+                max_tokens=900,
+                temperature=0.1,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            text = "".join(block.text for block in resp.content if getattr(block, "type", "") == "text").strip()
+    except Exception:
+        # A live call can't wait on a provider outage/bad model/rate limit — fall
+        # back to the always-available extractive answer instead of a hard 500.
+        answer, follow = demo_answer(question, results, style)
+        return answer, follow, "demo"
 
     follow = None
     if "FOLLOW_UP:" in text:
@@ -418,6 +681,46 @@ def heuristic_question(transcript: str) -> Optional[str]:
     return None
 
 
+def llm_detect_question(transcript: str, provider: str) -> tuple[bool, Optional[str]]:
+    """Ask the LLM to spot a customer question in a transcript tail.
+
+    Returns (ok, question). ok=False means the call itself failed (bad key,
+    network, rate limit) and the caller should fall back to the keyword
+    heuristic; ok=True with question=None means the model looked and found
+    no clear question, which the caller should trust as-is.
+    """
+    system = (
+        "You read a rolling transcript of a live sales call (may contain transcription errors and no punctuation). "
+        "Find the customer's most recent, clearly-asked question — a real ask, not small talk or the rep talking. "
+        "Reply with ONLY that question, cleaned up and ending in '?'. "
+        "If there is no clear customer question, reply with exactly: NONE"
+    )
+    user = f"TRANSCRIPT (most recent last):\n{transcript.strip()[-3000:]}"
+    try:
+        if provider == "openai":
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            resp = client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+                temperature=0, max_tokens=80,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            )
+            text = (resp.choices[0].message.content or "").strip()
+        else:
+            client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+            resp = client.messages.create(
+                model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
+                max_tokens=80, temperature=0,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+            text = "".join(block.text for block in resp.content if getattr(block, "type", "") == "text").strip()
+    except Exception:
+        return False, None
+    if not text or text.strip().upper().startswith("NONE"):
+        return True, None
+    return True, text.strip()
+
+
 @app.get("/health")
 def health():
     with db() as conn:
@@ -436,12 +739,19 @@ def list_documents():
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT d.id, d.filename, d.source_type, d.created_at, COUNT(c.id) AS chunks
+            SELECT d.id, d.filename, d.source_type, d.created_at, d.path, COUNT(c.id) AS chunks
             FROM documents d LEFT JOIN chunks c ON c.document_id=d.id
             GROUP BY d.id ORDER BY d.created_at DESC
             """
         ).fetchall()
-    return [dict(r) for r in rows]
+    result = []
+    for r in rows:
+        item = dict(r)
+        path = item.pop("path", None)
+        if item.get("source_type") in ("confluence", "web"):
+            item["source_url"] = path
+        result.append(item)
+    return result
 
 
 @app.post("/documents/upload")
@@ -479,6 +789,186 @@ def delete_document(document_id: str):
     return {"deleted": True}
 
 
+def _confluence_status_response() -> ConfluenceStatus:
+    cfg = get_confluence_config()
+    if not cfg:
+        return ConfluenceStatus(connected=False)
+    last_synced = cfg.get("last_synced_at")
+    return ConfluenceStatus(
+        connected=True,
+        base_url=cfg["base_url"],
+        email=cfg["email"],
+        space_key=cfg["space_key"],
+        space_name=cfg.get("space_name"),
+        last_synced_at=str(last_synced) if last_synced else None,
+        last_synced_pages=cfg.get("last_synced_pages") or 0,
+    )
+
+
+@app.get("/integrations/confluence/status", response_model=ConfluenceStatus)
+def confluence_status():
+    return _confluence_status_response()
+
+
+@app.post("/integrations/confluence/connect", response_model=ConfluenceStatus)
+def confluence_connect(req: ConfluenceConnectRequest):
+    base_url = req.base_url.strip().rstrip("/")
+    email = req.email.strip()
+    api_token = req.api_token.strip()
+    space_key = req.space_key.strip()
+    if not (base_url and email and api_token and space_key):
+        raise HTTPException(status_code=400, detail="Site URL, email, API token, and space key are all required")
+    try:
+        space = confluence_find_space(base_url, email, api_token, space_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=400, detail=f"Could not reach Confluence: {exc}")
+
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO confluence_config (id, base_url, email, api_token, space_key, space_name, last_synced_at, last_synced_pages)
+            VALUES (1, ?, ?, ?, ?, ?, NULL, 0)
+            ON CONFLICT(id) DO UPDATE SET base_url=excluded.base_url, email=excluded.email, api_token=excluded.api_token,
+                space_key=excluded.space_key, space_name=excluded.space_name, last_synced_at=NULL, last_synced_pages=0
+            """,
+            (base_url, email, api_token, space_key, space.get("name") or space_key),
+        )
+        conn.commit()
+    return _confluence_status_response()
+
+
+@app.post("/integrations/confluence/sync")
+def confluence_sync():
+    cfg = get_confluence_config()
+    if not cfg:
+        raise HTTPException(status_code=400, detail="Connect Confluence first")
+    try:
+        space = confluence_find_space(cfg["base_url"], cfg["email"], cfg["api_token"], cfg["space_key"])
+        pages = confluence_fetch_pages(cfg["base_url"], cfg["email"], cfg["api_token"], space["id"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Confluence sync failed: {exc}")
+
+    clear_confluence_documents()
+    indexed = 0
+    for page in pages:
+        if index_confluence_page(page, cfg["base_url"], cfg["space_key"]):
+            indexed += 1
+
+    space_name = space.get("name") or cfg["space_key"]
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO confluence_config (id, base_url, email, api_token, space_key, space_name, last_synced_at, last_synced_pages)
+            VALUES (1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+            ON CONFLICT(id) DO UPDATE SET space_name=excluded.space_name, last_synced_at=CURRENT_TIMESTAMP, last_synced_pages=excluded.last_synced_pages
+            """,
+            (cfg["base_url"], cfg["email"], cfg["api_token"], cfg["space_key"], space_name, indexed),
+        )
+        conn.commit()
+    return {"synced": True, "pages_found": len(pages), "pages_indexed": indexed}
+
+
+@app.delete("/integrations/confluence/disconnect")
+def confluence_disconnect():
+    clear_confluence_documents()
+    with db() as conn:
+        conn.execute("DELETE FROM confluence_config WHERE id=1")
+        conn.commit()
+    return {"disconnected": True}
+
+
+def _web_status_response() -> WebStatus:
+    cfg = get_web_config()
+    if not cfg:
+        return WebStatus(connected=False)
+    last_synced = cfg.get("last_synced_at")
+    return WebStatus(
+        connected=True,
+        label=cfg["label"],
+        sitemap_url=cfg["sitemap_url"],
+        path_prefix=cfg["path_prefix"],
+        last_synced_at=str(last_synced) if last_synced else None,
+        last_synced_pages=cfg.get("last_synced_pages") or 0,
+    )
+
+
+@app.get("/integrations/web/status", response_model=WebStatus)
+def web_status():
+    return _web_status_response()
+
+
+@app.post("/integrations/web/connect", response_model=WebStatus)
+def web_connect(req: WebConnectRequest):
+    sitemap_url = req.sitemap_url.strip()
+    path_prefix = req.path_prefix.strip()
+    label = req.label.strip() or "Docs"
+    if not (sitemap_url and path_prefix):
+        raise HTTPException(status_code=400, detail="Sitemap URL and path prefix are required")
+    try:
+        urls = fetch_sitemap_urls(sitemap_url, path_prefix)
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=400, detail=f"Could not reach that sitemap: {exc}")
+    if not urls:
+        raise HTTPException(status_code=400, detail="No pages found under that path prefix in the sitemap")
+
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO web_config (id, label, sitemap_url, path_prefix, last_synced_at, last_synced_pages)
+            VALUES (1, ?, ?, ?, NULL, 0)
+            ON CONFLICT(id) DO UPDATE SET label=excluded.label, sitemap_url=excluded.sitemap_url,
+                path_prefix=excluded.path_prefix, last_synced_at=NULL, last_synced_pages=0
+            """,
+            (label, sitemap_url, path_prefix),
+        )
+        conn.commit()
+    return _web_status_response()
+
+
+@app.post("/integrations/web/sync")
+def web_sync():
+    cfg = get_web_config()
+    if not cfg:
+        raise HTTPException(status_code=400, detail="Connect a website source first")
+    try:
+        urls = fetch_sitemap_urls(cfg["sitemap_url"], cfg["path_prefix"])
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach that sitemap: {exc}")
+    urls = urls[:MAX_WEB_PAGES]
+
+    clear_web_documents()
+    indexed = 0
+    for url in urls:
+        if index_web_page(url, cfg["label"]):
+            indexed += 1
+        time.sleep(0.12)  # be polite to the source site
+
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO web_config (id, label, sitemap_url, path_prefix, last_synced_at, last_synced_pages)
+            VALUES (1, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+            ON CONFLICT(id) DO UPDATE SET last_synced_at=CURRENT_TIMESTAMP, last_synced_pages=excluded.last_synced_pages
+            """,
+            (cfg["label"], cfg["sitemap_url"], cfg["path_prefix"], indexed),
+        )
+        conn.commit()
+    return {"synced": True, "pages_found": len(urls), "pages_indexed": indexed}
+
+
+@app.delete("/integrations/web/disconnect")
+def web_disconnect():
+    clear_web_documents()
+    with db() as conn:
+        conn.execute("DELETE FROM web_config WHERE id=1")
+        conn.commit()
+    return {"disconnected": True}
+
+
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
     question = req.question.strip()
@@ -493,7 +983,8 @@ def ask(req: AskRequest):
     sources = [
         Source(
             document_id=r["document_id"], filename=r["filename"], chunk_index=r["chunk_index"],
-            score=round(r["score"], 4), excerpt=(r["content"][:520] + "…") if len(r["content"]) > 520 else r["content"]
+            score=round(r["score"], 4), excerpt=(r["content"][:520] + "…") if len(r["content"]) > 520 else r["content"],
+            url=r.get("url"),
         ) for r in results if r["score"] > 0
     ]
     return AskResponse(answer=answer, confidence=round(confidence, 2), sources=sources, follow_up=follow, mode=f"{provider}+rag", provider=provider, question=question)
@@ -501,6 +992,11 @@ def ask(req: AskRequest):
 
 @app.post("/detect-question")
 def detect_question(req: DetectRequest):
+    provider = resolve_provider(req.provider)
+    if provider != "demo":
+        ok, q = llm_detect_question(req.transcript, provider)
+        if ok:
+            return {"question_detected": bool(q), "question": q}
     q = heuristic_question(req.transcript)
     return {"question_detected": bool(q), "question": q}
 

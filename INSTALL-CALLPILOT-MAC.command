@@ -47,6 +47,16 @@ step "Installing backend dependencies"
 step "Installing native CallPilot companion"
 (cd "$ROOT/native-overlay" && npm install --silent) || fail "Native companion dependency installation failed."
 
+step "Packaging CallPilot as a signed macOS app"
+# A raw `electron .` dev process has no stable signed identity, so macOS
+# cannot reliably track Screen Recording/Microphone permission grants for it.
+# Packaging gives CallPilot its own bundle id (com.callpilot.ai) and an
+# ad-hoc code signature bound to it, so permissions actually persist.
+(cd "$ROOT/native-overlay" && npm run dist --silent) || fail "CallPilot app packaging failed."
+PACKAGED_APP="$(find "$ROOT/native-overlay/dist" -maxdepth 2 -iname "CallPilot AI.app" 2>/dev/null | head -1)"
+if [ -z "$PACKAGED_APP" ]; then fail "Packaged CallPilot AI.app was not found after build."; fi
+codesign --force --deep --sign - "$PACKAGED_APP" || fail "Could not sign the packaged CallPilot AI.app."
+
 step "Installing automatic startup at Mac login"
 PLIST="$HOME/Library/LaunchAgents/com.callpilot.ai.plist"
 mkdir -p "$HOME/Library/LaunchAgents"
@@ -68,8 +78,12 @@ launchctl enable "gui/$(id -u)/com.callpilot.ai" >/dev/null 2>&1 || true
 
 step "Starting CallPilot now"
 "$ROOT/AUTOSTART-CALLPILOT.command"
-sleep 3
-if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then ok "Backend is healthy"; else fail "Backend failed to start; check .callpilot-logs/backend.log"; fi
+BACKEND_UP=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then BACKEND_UP=1; break; fi
+  sleep 2
+done
+if [ -n "$BACKEND_UP" ]; then ok "Backend is healthy"; else fail "Backend failed to start; check .callpilot-logs/backend.log"; fi
 
 touch "$ROOT/.callpilot-installed"
 mkdir -p "$HOME/Applications"
@@ -77,5 +91,5 @@ mkdir -p "$HOME/Applications"
 ok "CallPilot installation complete"
 printf "\nFrom now on, CallPilot starts automatically when you log in to your Mac.\n"
 printf "Use the Chrome window/profile labelled by CallPilot. When a supported meeting opens, you will get a reminder.\n"
-printf "Click the CallPilot extension → Start Call once. It will stop itself when the meeting ends or the tab closes.\n\n"
+printf "Click the CallPilot menu bar icon → Start Call once. It will stop itself when the meeting ends or the tab closes.\n\n"
 read -r -p "Press Enter to close this installer..."

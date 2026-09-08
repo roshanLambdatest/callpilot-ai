@@ -11,9 +11,16 @@ start_backend(){
   fi
 }
 
+PACKAGED_APP="$(find "$ROOT/native-overlay/dist" -maxdepth 2 -iname "CallPilot AI.app" 2>/dev/null | head -1)"
+
 start_companion(){
-  if pgrep -f "$ROOT/native-overlay.*electron" >/dev/null 2>&1 || pgrep -f "$ROOT/native-overlay" >/dev/null 2>&1; then return 0; fi
-  if [ -d "$ROOT/native-overlay/node_modules/electron" ]; then
+  if pgrep -f "$PACKAGED_APP" >/dev/null 2>&1 || pgrep -f "$ROOT/native-overlay.*electron" >/dev/null 2>&1; then return 0; fi
+  if [ -d "$PACKAGED_APP" ]; then
+    open "$PACKAGED_APP" >>"$LOG_DIR/overlay.log" 2>&1
+  elif [ -d "$ROOT/native-overlay/node_modules/electron" ]; then
+    # Fallback for a dev checkout that has not been packaged yet. Screen
+    # Recording/Microphone permissions will not persist reliably in this mode
+    # since the raw dev Electron binary has no stable signed app identity.
     (cd "$ROOT/native-overlay" && nohup npm start >>"$LOG_DIR/overlay.log" 2>&1 & echo $! > "$ROOT/.overlay.pid")
   fi
 }

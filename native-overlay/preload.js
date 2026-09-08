@@ -3,5 +3,9 @@ contextBridge.exposeInMainWorld('callpilot', {
   platformInfo: () => ipcRenderer.invoke('platform-info'),
   setExpanded: (value) => ipcRenderer.send('set-overlay-expanded', value),
   hide: () => ipcRenderer.send('hide-overlay'),
-  onMode: (callback) => ipcRenderer.on('overlay-mode', (_event, payload) => callback(payload))
+  dragBy: (dx, dy) => ipcRenderer.send('drag-overlay', { dx, dy }),
+  onMode: (callback) => ipcRenderer.on('overlay-mode', (_event, payload) => callback(payload)),
+  getCallStatus: () => ipcRenderer.invoke('get-call-status'),
+  onCallStatus: (callback) => ipcRenderer.on('call-status', (_event, payload) => callback(payload)),
+  apiConfig: () => ipcRenderer.invoke('get-api-config')
 });

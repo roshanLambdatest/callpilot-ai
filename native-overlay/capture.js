@@ -1,4 +1,13 @@
-const API = 'http://127.0.0.1:8000';
+let API = 'http://127.0.0.1:8000';
+let API_KEY = '';
+let configReady = window.captureIPC.apiConfig().then((cfg) => {
+  if (cfg && cfg.apiBase) API = cfg.apiBase;
+  if (cfg && cfg.apiKey) API_KEY = cfg.apiKey;
+});
+function authHeaders(extra = {}) {
+  return API_KEY ? Object.assign({ 'X-CallPilot-Key': API_KEY }, extra) : extra;
+}
+
 let active = false;
 let displayStream = null;
 let micStream = null;
@@ -12,7 +21,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function postJson(path, body) {
   const r = await fetch(`${API}${path}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(body)
   });
   if (!r.ok) throw new Error(`${path}: ${await r.text()}`);
   return r.json();
@@ -68,7 +77,7 @@ function recordSegment(durationMs) {
 async function transcribe(blob) {
   const form = new FormData();
   form.append('file', blob, 'call-segment.webm');
-  const r = await fetch(`${API}/transcribe`, { method: 'POST', body: form, signal: abortController?.signal });
+  const r = await fetch(`${API}/transcribe`, { method: 'POST', headers: authHeaders(), body: form, signal: abortController?.signal });
   if (!r.ok) throw new Error(`Transcription failed: ${await r.text()}`);
   return r.json();
 }
@@ -112,6 +121,7 @@ async function loop(segmentMs) {
 async function start(opts={}) {
   if (active) return { ok: true, alreadyActive: true };
   try {
+    await configReady;
     abortController = new AbortController();
     rollingTranscript = '';
     lastQuestion = '';

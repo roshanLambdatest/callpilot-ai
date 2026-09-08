@@ -14,37 +14,46 @@
   <main id="panel" class="panel" hidden>
     <header class="topbar">
       <div class="brand">
-        <span class="brandIcon">✦</span>
+        <span id="brandIcon" class="brandIcon">✦</span>
         <span>CallPilot</span>
-        <span id="statusDot" class="statusDot"></span>
+        <span id="statusDot" class="statusDot state-idle"></span>
       </div>
       <button id="collapse" class="iconButton" aria-label="Minimize">—</button>
     </header>
 
-    <section id="empty" class="emptyState">
-      <div class="emptyIcon">✦</div>
-      <div class="emptyTitle">CallPilot is listening</div>
-      <div class="emptyHint">Answers will appear here when a customer asks a question.</div>
-    </section>
+    <div id="scrollArea" class="scrollArea">
+      <section id="empty" class="emptyState">
+        <div id="emptyIcon" class="emptyIcon">✦</div>
+        <div id="emptyTitle" class="emptyTitle">CallPilot is ready</div>
+        <div id="emptyHint" class="emptyHint">Click Start Call from the CallPilot menu bar icon when you're on a call.</div>
+      </section>
 
-    <section id="content" hidden>
-      <div class="qaBlock">
-        <div class="label">QUESTION</div>
-        <div id="question" class="question"></div>
-      </div>
+      <section id="content" hidden>
+        <div class="qaBlock">
+          <div class="label">QUESTION</div>
+          <div id="question" class="question"></div>
+        </div>
 
-      <div class="qaBlock answerBlock">
-        <div class="label">ANSWER</div>
-        <div id="answer" class="answer"></div>
-      </div>
+        <div class="qaBlock answerBlock">
+          <div class="label">ANSWER</div>
+          <div id="answer" class="answer"></div>
+        </div>
 
-      <div id="follow" class="follow" hidden></div>
+        <div id="follow" class="follow" hidden></div>
 
-      <footer>
-        <span id="source"></span>
-        <span id="confidence"></span>
-      </footer>
-    </section>
+        <footer>
+          <span id="source"></span>
+          <span id="confidence"></span>
+        </footer>
+      </section>
+
+      <section id="askLog" class="askLog" hidden></section>
+    </div>
+
+    <form id="askForm" class="askBar">
+      <input id="askInput" type="text" class="askInput" placeholder="Ask the knowledge base…" autocomplete="off" maxlength="500" />
+      <button id="askSend" type="submit" class="askSend" aria-label="Ask">➤</button>
+    </form>
   </main>
 
   <script src="overlay.js"></script>

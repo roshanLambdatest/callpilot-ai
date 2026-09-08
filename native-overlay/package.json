@@ -2,9 +2,40 @@
   "name": "callpilot-native-companion",
   "version": "4.3.0",
   "main": "main.js",
+  "author": "CallPilot AI",
+  "description": "CallPilot AI private call assistant overlay",
   "scripts": {
     "start": "electron .",
-    "test": "node --test meetingLifecycle.test.cjs"
+    "test": "node --test meetingLifecycle.test.cjs",
+    "dist": "electron-builder --mac --dir"
   },
-  "devDependencies": { "electron": "^44.0.0" }
+  "devDependencies": { "electron": "^44.0.0", "electron-builder": "^25.1.8" },
+  "build": {
+    "appId": "com.callpilot.ai",
+    "productName": "CallPilot AI",
+    "files": [
+      "main.js",
+      "preload.js",
+      "capture.js",
+      "capture.html",
+      "capture-preload.js",
+      "overlay.js",
+      "overlay.html",
+      "overlay.css",
+      "meetingLifecycle.js",
+      "trayTemplate.png",
+      "runtime-config.json"
+    ],
+    "directories": { "output": "dist", "buildResources": "build" },
+    "mac": {
+      "icon": "build/icon.icns",
+      "category": "public.app-category.productivity",
+      "target": [{ "target": "dir" }],
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "CallPilot needs microphone access to transcribe your side of the call.",
+        "NSAudioCaptureUsageDescription": "CallPilot needs system audio access to capture the call for live transcription.",
+        "LSUIElement": true
+      }
+    }
+  }
 }

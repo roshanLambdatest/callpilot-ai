@@ -1,7 +1,23 @@
-const { app, BrowserWindow, globalShortcut, ipcMain, screen, Tray, Menu, nativeImage, Notification, session, desktopCapturer } = require('electron');
+const { app, BrowserWindow, globalShortcut, ipcMain, screen, Tray, Menu, nativeImage, Notification, session, desktopCapturer, systemPreferences, shell } = require('electron');
 const { execFile } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 const { isSupportedMeetingUrl, looksLikeEndedTitle, shouldAutoStop } = require('./meetingLifecycle');
+
+// Lets a packaged team build point at a hosted backend (with its own access
+// key) instead of localhost, without baking that into source control — see
+// runtime-config.example.json. Missing file = local dev defaults.
+function loadRuntimeConfig() {
+  const defaults = { apiBase: 'http://127.0.0.1:8000', apiKey: '' };
+  try {
+    const raw = fs.readFileSync(path.join(__dirname, 'runtime-config.json'), 'utf8');
+    return Object.assign({}, defaults, JSON.parse(raw));
+  } catch (_) {
+    return defaults;
+  }
+}
+const RUNTIME_CONFIG = loadRuntimeConfig();
+ipcMain.handle('get-api-config', () => RUNTIME_CONFIG);
 
 let win;
 let captureWin;
@@ -16,7 +32,7 @@ let lastDetectedMeeting = null;
 let lastError = '';
 
 const COLLAPSED = { width: 62, height: 62 };
-const EXPANDED = { width: 430, height: 360 };
+const EXPANDED = { width: 430, height: 460 };
 const REMINDER_COOLDOWN_MS = 5 * 60 * 1000;
 const MEETING_POLL_MS = 7000;
 const AUTO_STOP_GRACE_MS = 30000;
@@ -67,6 +83,9 @@ function createOverlay() {
   win.loadFile('overlay.html');
   win.once('ready-to-show', () => applyMode(false));
   win.on('closed', () => (win = null));
+  win.webContents.on('console-message', (event) => {
+    if (event.level >= 2) console.log('[overlay renderer]', event.message);
+  });
 }
 
 async function createCaptureWindow() {
@@ -123,6 +142,18 @@ function rebuildTrayMenu() {
   tray.setToolTip(statusText());
 }
 
+function computeCallStatus() {
+  if (captureStarting) return { state: 'starting', message: '' };
+  if (callActive) return { state: 'listening', message: '' };
+  if (lastError) return { state: 'error', message: lastError };
+  return { state: 'idle', message: '' };
+}
+
+function pushCallStatus() {
+  if (!win) return;
+  win.webContents.send('call-status', computeCallStatus());
+}
+
 function notify(title, body) {
   try {
     if (!Notification.isSupported()) return;
@@ -130,6 +161,24 @@ function notify(title, body) {
     n.show();
     return n;
   } catch (_) {}
+}
+
+async function ensurePermissions() {
+  if (process.platform !== 'darwin') return { ok: true };
+  let micStatus = systemPreferences.getMediaAccessStatus('microphone');
+  if (micStatus === 'not-determined') {
+    try { await systemPreferences.askForMediaAccess('microphone'); } catch (_) {}
+    micStatus = systemPreferences.getMediaAccessStatus('microphone');
+  }
+  let screenStatus = systemPreferences.getMediaAccessStatus('screen');
+  if (screenStatus === 'not-determined') {
+    // There is no askForMediaAccess() for screen recording; the only way to
+    // register with TCC and trigger the system prompt is an actual capture
+    // attempt.
+    try { await desktopCapturer.getSources({ types: ['screen'] }); } catch (_) {}
+    screenStatus = systemPreferences.getMediaAccessStatus('screen');
+  }
+  return { ok: micStatus === 'granted' && screenStatus === 'granted', micStatus, screenStatus };
 }
 
 async function checkBackend(showResult=false) {
@@ -151,10 +200,23 @@ async function startCall(source='menu') {
   captureStarting = true;
   lastError = '';
   rebuildTrayMenu();
+  pushCallStatus();
   if (!(await checkBackend(false))) {
     captureStarting = false;
+    lastError = 'Knowledge backend is unavailable.';
     rebuildTrayMenu();
+    pushCallStatus();
     notify('CallPilot could not start', 'Knowledge backend is unavailable.');
+    return;
+  }
+  const perms = await ensurePermissions();
+  if (!perms.ok) {
+    captureStarting = false;
+    lastError = 'Screen Recording and Microphone access are required for CallPilot AI. Grant both in System Settings, then try Start Call again.';
+    rebuildTrayMenu();
+    pushCallStatus();
+    notify('CallPilot needs permission', lastError);
+    try { shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'); } catch (_) {}
     return;
   }
   try {
@@ -166,12 +228,14 @@ async function startCall(source='menu') {
     missingSince = null;
     captureStarting = false;
     rebuildTrayMenu();
+    pushCallStatus();
     notify('CallPilot is listening', 'Call audio is being transcribed locally. Answers will appear in the private assistant.');
   } catch (e) {
     callActive = false;
     captureStarting = false;
     lastError = e.message || String(e);
     rebuildTrayMenu();
+    pushCallStatus();
     notify('CallPilot could not capture audio', `${lastError}\nCheck System Settings → Privacy & Security → Screen & System Audio Recording / Microphone.`);
   }
 }
@@ -187,8 +251,13 @@ async function stopCall(reason='manual') {
   captureStarting = false;
   hadMeeting = false;
   missingSince = null;
+  lastError = '';
   rebuildTrayMenu();
-  if (reason !== 'quit') notify('CallPilot stopped', reason === 'meeting-ended' ? 'Meeting ended, so CallPilot stopped automatically.' : 'Call capture has stopped.');
+  pushCallStatus();
+  if (reason !== 'quit') {
+    applyMode(false);
+    notify('CallPilot stopped', reason === 'meeting-ended' ? 'Meeting ended, so CallPilot stopped automatically.' : 'Call capture has stopped.');
+  }
 }
 
 function runAppleScript(script) {
@@ -274,11 +343,18 @@ ipcMain.handle('platform-info', () => ({
   protected: !!win?.isContentProtected?.(),
   guarantee: process.platform === 'win32' ? 'best-supported' : process.platform === 'darwin' ? 'not-guaranteed' : 'unsupported'
 }));
+ipcMain.handle('get-call-status', () => computeCallStatus());
 ipcMain.on('set-overlay-expanded', (_event, value) => applyMode(!!value));
 ipcMain.on('hide-overlay', () => applyMode(false));
+ipcMain.on('drag-overlay', (_event, { dx, dy }) => {
+  if (!win) return;
+  const b = win.getBounds();
+  win.setBounds({ x: Math.round(b.x + dx), y: Math.round(b.y + dy), width: b.width, height: b.height });
+});
 ipcMain.on('capture-ended', (_event, reason) => { if (callActive) stopCall(reason || 'stream-ended'); });
 ipcMain.on('capture-error', (_event, message) => {
   lastError = String(message || 'Capture error');
   rebuildTrayMenu();
+  pushCallStatus();
   notify('CallPilot capture issue', lastError);
 });

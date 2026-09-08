@@ -15,11 +15,7 @@ popd
 start "CallPilot Backend" /min cmd /c "cd /d "%ROOT%\backend" && "%ROOT%\backend\.venv\Scripts\python.exe" -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > "%ROOT%\.callpilot-logs\backend.log" 2>&1"
 start "CallPilot Overlay" /min cmd /c "cd /d "%ROOT%\native-overlay" && npm start > "%ROOT%\.callpilot-logs\overlay.log" 2>&1"
 timeout /t 3 /nobreak >nul
-set CHROME=%ProgramFiles%\Google\Chrome\Application\chrome.exe
-if not exist "%CHROME%" set CHROME=%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe
-if not exist "%CHROME%" set CHROME=%LocalAppData%\Google\Chrome\Application\chrome.exe
-if not exist "%CHROME%" (echo Google Chrome not found.& pause & exit /b 1)
-start "" "%CHROME%" --user-data-dir="%ROOT%\.callpilot-chrome-profile" --load-extension="%ROOT%\extension" https://meet.google.com/
 echo.
-echo CallPilot is running. Join the meeting, click the extension icon, then Start Call.
+echo CallPilot is running. There is no Chrome extension in v4.3 - use your normal
+echo Chrome, join the meeting, then click the CallPilot tray icon and choose Start Call.
 pause
